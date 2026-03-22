@@ -5,8 +5,46 @@ edition = "2024"
 description = "Kernel TLS (kTLS) support for Compio"
 repository = "https://github.com/fantix/compio-ktls"
 license = "Apache-2.0 OR MulanPSL-2.0"
+authors = ["Fantix King <fantix.king@gmail.com>"]
 keywords = ["ktls", "tls", "compio", "async", "kernel"]
 categories = ["asynchronous", "network-programming", "cryptography"]
 readme = "README.md"
 
 [dependencies]
+rustls = { version = "0.23", default-features = false, optional = true }
+
+[dependencies.compio-io]
+version = "0.9"
+default-features = false
+features = ["ancillary", "bytemuck"]
+
+[dependencies.compio-buf]
+version = "0.8"
+default-features = false
+
+[target."cfg(target_os = \"linux\")".dependencies]
+libc = "0.2"
+ktls-core = "0.0.5"
+
+[features]
+default = ["rustls"]
+rustls = ["dep:rustls", "ktls-core/shim-rustls"]
+ring = ["rustls", "rustls/ring"]
+app-write-with-empty-ancillary = []
+
+[dev-dependencies]
+compio = { version = "0.18", features = ["net", "rustls", "macros"] }
+rustls-native-certs = "0.8"
+rustls-pemfile = "2.2"
+
+[patch.crates-io.compio]
+git = "https://github.com/fantix/compio.git"
+rev = "a40dbc4685898f61f8a6702da9aa38872e5f7629"
+
+[patch.crates-io.compio-io]
+git = "https://github.com/fantix/compio.git"
+rev = "a40dbc4685898f61f8a6702da9aa38872e5f7629"
+
+[patch.crates-io.compio-buf]
+git = "https://github.com/fantix/compio.git"
+rev = "a40dbc4685898f61f8a6702da9aa38872e5f7629"
