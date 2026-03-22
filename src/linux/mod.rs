@@ -28,17 +28,16 @@ async fn read_record<S: AsyncRead, B: IoBufMut>(stream: &mut S, mut buf: B) -> i
     Ok(buf_try!(@try stream.read_exact(buf.slice(offset..offset + len)).await.into_inner()).1)
 }
 
-fn setup_ktls<S, C, K, E>(socket: &S, secrets: K, session: &C) -> Result<(), ktls_core::Error>
+fn setup_ktls<S, C, K>(socket: &S, secrets: K, session: &C) -> Result<(), ktls_core::Error>
 where
     S: AsFd,
     C: TlsSession,
-    ExtractedSecrets: TryFrom<K, Error = E>,
-    ktls_core::Error: From<E>,
+    K: TryInto<ExtractedSecrets, Error = ktls_core::Error>,
 {
     let ExtractedSecrets {
         tx: (seq_tx, secrets_tx),
         rx: (seq_rx, secrets_rx),
-    } = ExtractedSecrets::try_from(secrets)?;
+    } = secrets.try_into()?;
 
     let protocol_version = session.protocol_version();
     let tls_crypto_info_tx = TlsCryptoInfoTx::new(protocol_version, secrets_tx, seq_tx)?;
