@@ -14,6 +14,7 @@ Kernel TLS (kTLS) support for [Compio](https://github.com/compio-rs/compio).
 - Pluggable TLS implementations (currently supports Rustls)
 - Currently supports TLS 1.3 only
 - Supports NewSessionTicket, KeyUpdate, and Alert message handling
+- Supports splitting `KtlsStream` into read/write halves for concurrent I/O
 
 ## Features
 
@@ -24,6 +25,9 @@ Kernel TLS (kTLS) support for [Compio](https://github.com/compio-rs/compio).
   which changed the default behavior of `write()` in a way that breaks on kTLS-enabled
   sockets. Enable this feature when using io-uring to work around the conflict between
   zero-copy writes and kTLS.
+- `sync`: Use thread-safe locks for the split read/write halves. By default, single-threaded
+  (unsync) locks are used. Enable this feature if you need to use the split halves across
+  threads.
 
 ## Usage
 
@@ -51,6 +55,15 @@ match acceptor.accept(tcp_stream).await? {
         // kTLS unavailable, fallback to original stream
     }
 }
+```
+
+You can split a `KtlsStream` into independent read and write halves for concurrent I/O:
+
+```rust
+use compio::io::util::Splittable;
+
+let (mut reader, mut writer) = stream.split();
+// Now reader and writer can be used concurrently
 ```
 
 ## Requirements

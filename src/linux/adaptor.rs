@@ -7,9 +7,10 @@ use compio_buf::{BufResult, IoBuf, IoBufMut, IoVectoredBuf, IoVectoredBufMut};
 use compio_io::{
     AsyncRead, AsyncWrite,
     ancillary::{AsyncReadAncillary, AsyncWriteAncillary},
+    util::Splittable,
 };
 
-use super::stream::KtlsDuplexStream;
+use super::stream::{KtlsDuplexStream, ReadHalf, WriteHalf};
 
 /// A kTLS connector for establishing client-side TLS connections.
 ///
@@ -342,6 +343,147 @@ where
             KtlsStreamInner::RustlsServer(s) => s.shutdown().await,
             #[cfg(not(feature = "rustls"))]
             KtlsStreamInner::None(f, ..) => match *f {},
+        }
+    }
+}
+
+impl<S> Splittable for KtlsStream<S>
+where
+    S: Clone,
+{
+    type ReadHalf = KtlsReadHalf<S>;
+    type WriteHalf = KtlsWriteHalf<S>;
+
+    fn split(self) -> (Self::ReadHalf, Self::WriteHalf) {
+        match self.0 {
+            #[cfg(feature = "rustls")]
+            KtlsStreamInner::RustlsClient(s) => {
+                let (r, w) = s.split();
+                let r = KtlsReadHalf(KtlsReadHalfInner::RustlsClient(r));
+                let w = KtlsWriteHalf(KtlsWriteHalfInner::RustlsClient(w));
+                (r, w)
+            }
+            #[cfg(feature = "rustls")]
+            KtlsStreamInner::RustlsServer(s) => {
+                let (r, w) = s.split();
+                let r = KtlsReadHalf(KtlsReadHalfInner::RustlsServer(r));
+                let w = KtlsWriteHalf(KtlsWriteHalfInner::RustlsServer(w));
+                (r, w)
+            }
+            #[cfg(not(feature = "rustls"))]
+            KtlsStreamInner::None(f, ..) => match *f {},
+        }
+    }
+}
+
+pub struct KtlsReadHalf<S>(KtlsReadHalfInner<S>);
+
+#[cfg(feature = "rustls")]
+type RustlsClientReadHalf<S> =
+    ReadHalf<S, rustls::kernel::KernelConnection<rustls::client::ClientConnectionData>>;
+#[cfg(feature = "rustls")]
+type RustlsServerReadHalf<S> =
+    ReadHalf<S, rustls::kernel::KernelConnection<rustls::server::ServerConnectionData>>;
+
+enum KtlsReadHalfInner<S> {
+    #[cfg(feature = "rustls")]
+    RustlsClient(RustlsClientReadHalf<S>),
+    #[cfg(feature = "rustls")]
+    RustlsServer(RustlsServerReadHalf<S>),
+    #[cfg(not(feature = "rustls"))]
+    None(std::convert::Infallible, std::marker::PhantomData<S>),
+}
+
+impl<S> AsyncRead for KtlsReadHalf<S>
+where
+    S: AsyncRead + AsyncWrite + AsyncReadAncillary + AsyncWriteAncillary + AsFd,
+{
+    async fn read<B: IoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
+        match &mut self.0 {
+            #[cfg(feature = "rustls")]
+            KtlsReadHalfInner::RustlsClient(s) => s.read(buf).await,
+            #[cfg(feature = "rustls")]
+            KtlsReadHalfInner::RustlsServer(s) => s.read(buf).await,
+            #[cfg(not(feature = "rustls"))]
+            KtlsReadHalfInner::None(f, ..) => match *f {},
+        }
+    }
+
+    async fn read_vectored<V: IoVectoredBufMut>(&mut self, buf: V) -> BufResult<usize, V> {
+        match &mut self.0 {
+            #[cfg(feature = "rustls")]
+            KtlsReadHalfInner::RustlsClient(s) => s.read_vectored(buf).await,
+            #[cfg(feature = "rustls")]
+            KtlsReadHalfInner::RustlsServer(s) => s.read_vectored(buf).await,
+            #[cfg(not(feature = "rustls"))]
+            KtlsReadHalfInner::None(f, ..) => match *f {},
+        }
+    }
+}
+
+pub struct KtlsWriteHalf<S>(KtlsWriteHalfInner<S>);
+
+#[cfg(feature = "rustls")]
+type RustlsClientWriteHalf<S> =
+    WriteHalf<S, rustls::kernel::KernelConnection<rustls::client::ClientConnectionData>>;
+#[cfg(feature = "rustls")]
+type RustlsServerWriteHalf<S> =
+    WriteHalf<S, rustls::kernel::KernelConnection<rustls::server::ServerConnectionData>>;
+
+enum KtlsWriteHalfInner<S> {
+    #[cfg(feature = "rustls")]
+    RustlsClient(RustlsClientWriteHalf<S>),
+    #[cfg(feature = "rustls")]
+    RustlsServer(RustlsServerWriteHalf<S>),
+    #[cfg(not(feature = "rustls"))]
+    None(std::convert::Infallible, std::marker::PhantomData<S>),
+}
+
+impl<S> AsyncWrite for KtlsWriteHalf<S>
+where
+    S: AsyncWrite + AsyncReadAncillary + AsyncWriteAncillary + AsFd,
+{
+    async fn write<B: IoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
+        match &mut self.0 {
+            #[cfg(feature = "rustls")]
+            KtlsWriteHalfInner::RustlsClient(s) => s.write(buf).await,
+            #[cfg(feature = "rustls")]
+            KtlsWriteHalfInner::RustlsServer(s) => s.write(buf).await,
+            #[cfg(not(feature = "rustls"))]
+            KtlsWriteHalfInner::None(f, ..) => match *f {},
+        }
+    }
+
+    async fn write_vectored<V: IoVectoredBuf>(&mut self, buf: V) -> BufResult<usize, V> {
+        match &mut self.0 {
+            #[cfg(feature = "rustls")]
+            KtlsWriteHalfInner::RustlsClient(s) => s.write_vectored(buf).await,
+            #[cfg(feature = "rustls")]
+            KtlsWriteHalfInner::RustlsServer(s) => s.write_vectored(buf).await,
+            #[cfg(not(feature = "rustls"))]
+            KtlsWriteHalfInner::None(f, ..) => match *f {},
+        }
+    }
+
+    async fn flush(&mut self) -> io::Result<()> {
+        match &mut self.0 {
+            #[cfg(feature = "rustls")]
+            KtlsWriteHalfInner::RustlsClient(s) => s.flush().await,
+            #[cfg(feature = "rustls")]
+            KtlsWriteHalfInner::RustlsServer(s) => s.flush().await,
+            #[cfg(not(feature = "rustls"))]
+            KtlsWriteHalfInner::None(f, ..) => match *f {},
+        }
+    }
+
+    async fn shutdown(&mut self) -> io::Result<()> {
+        match &mut self.0 {
+            #[cfg(feature = "rustls")]
+            KtlsWriteHalfInner::RustlsClient(s) => s.shutdown().await,
+            #[cfg(feature = "rustls")]
+            KtlsWriteHalfInner::RustlsServer(s) => s.shutdown().await,
+            #[cfg(not(feature = "rustls"))]
+            KtlsWriteHalfInner::None(f, ..) => match *f {},
         }
     }
 }

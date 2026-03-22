@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MulanPSL-2.0
 // Copyright 2026 Fantix King
 
-use std::{fmt, future::Future, io, os::fd::AsFd, pin::Pin};
+use std::{fmt, io, os::fd::AsFd};
 
 use compio_buf::{BufResult, IoBuf, IoBufMut, IoVectoredBuf, IoVectoredBufMut, buf_try};
 use compio_io::{
@@ -10,135 +10,10 @@ use compio_io::{
 };
 use ktls_core::{AlertDescription, TlsSession};
 
-use super::tls::{
-    AlertMessage, HandshakeMessage, IntoMessage, KeyUpdateRequest, ReadMessage, TlsMessage,
-    WriteMessage,
+use super::{
+    IntoMessage, KeyUpdateRequest, KtlsImplementation, OutgoingState, WriteMessage,
+    split::{self, ReadHalf, WriteHalf},
 };
-
-trait KtlsImplementation: Sized {
-    type Stream: AsyncWrite + AsyncWriteAncillary + AsyncReadAncillary;
-
-    fn stream(&mut self) -> io::Result<&mut Self::Stream>;
-
-    fn close(&mut self);
-
-    fn set_incoming_closed(&mut self);
-
-    async fn handle_new_session_ticket(&mut self, payload: &[u8]) -> io::Result<()>;
-
-    async fn update_incoming_secret(&mut self) -> io::Result<()>;
-
-    async fn update_outgoing_secret(&mut self, request_peer: bool) -> io::Result<()>;
-
-    async fn inspect_error<T>(&mut self, err: io::Error) -> io::Result<T> {
-        use io::ErrorKind::*;
-        let description = match err.kind() {
-            Interrupted | WouldBlock => return Err(err),
-            BrokenPipe | ConnectionReset => None,
-            InvalidData => Some(AlertDescription::DecodeError),
-            _ => Some(AlertDescription::InternalError),
-        };
-        if let Some(description) = description
-            && let Ok(stream) = self.stream()
-            && description.into_message().write(stream).await.is_ok()
-        {
-            stream.flush().await.ok();
-        }
-        self.close();
-        Err(err)
-    }
-
-    async fn handle_control_messages(&mut self) -> io::Result<()> {
-        let ((len, tls_msg), buf) =
-            buf_try!(@try TlsMessage::read(self.stream()?, Vec::with_capacity(1024)).await);
-        match tls_msg {
-            TlsMessage::Handshake(msg) => {
-                self.handle_same_messages(buf, len, msg, |slf, msg| {
-                    Box::pin(slf.handle_handshake_messages(msg))
-                })
-                .await
-            }
-            TlsMessage::Alert(msg) => {
-                self.handle_same_messages(buf, len, msg, |slf, msg| {
-                    Box::pin(slf.handle_alert_message(msg))
-                })
-                .await
-            }
-            TlsMessage::ApplicationData => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unexpected application data record on control channel",
-            )),
-        }
-    }
-
-    async fn handle_same_messages<T, F>(
-        &mut self,
-        mut buf: Vec<u8>,
-        mut len: usize,
-        mut msg: T,
-        mut f: F,
-    ) -> io::Result<()>
-    where
-        T: ReadMessage,
-        F: for<'a> FnMut(&'a mut Self, T) -> Pin<Box<dyn Future<Output = io::Result<()>> + 'a>>,
-    {
-        loop {
-            f(self, msg).await?;
-            if len < buf.len() {
-                buf.drain(..len);
-                ((len, msg), buf) = buf_try!(@try T::read(self.stream()?, buf).await);
-            } else {
-                break Ok(());
-            }
-        }
-    }
-
-    async fn handle_handshake_messages(&mut self, msg: HandshakeMessage<'_>) -> io::Result<()> {
-        match msg {
-            HandshakeMessage::NewSessionTicket(buf) => self.handle_new_session_ticket(&buf).await,
-            HandshakeMessage::KeyUpdate(req) => {
-                self.update_incoming_secret().await?;
-                if req.requested() {
-                    self.update_outgoing_secret(false).await?;
-                }
-                Ok(())
-            }
-        }
-    }
-
-    async fn handle_alert_message(&mut self, msg: AlertMessage) -> io::Result<()> {
-        use AlertDescription::*;
-        match msg.into_inner().1 {
-            UserCanceled => Ok(()),
-            CloseNotify => {
-                self.set_incoming_closed();
-                Ok(())
-            }
-            description => {
-                self.close();
-                Err(io::Error::new(
-                    io::ErrorKind::ConnectionReset,
-                    format!("Error alert: {description:?}"),
-                ))
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OutgoingState {
-    Open,
-    CloseNotifySent,
-    Flushed,
-    Closed,
-}
-
-impl OutgoingState {
-    #[inline]
-    fn is_open(&self) -> bool {
-        matches!(self, Self::Open)
-    }
-}
 
 pub(crate) struct KtlsDuplexStream<S, C> {
     inner: Option<S>,
@@ -156,6 +31,12 @@ impl<S, C> KtlsDuplexStream<S, C> {
             outgoing_state: OutgoingState::Open,
         }
     }
+
+    fn stream(&mut self) -> io::Result<&mut S> {
+        self.inner
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "stream is closed"))
+    }
 }
 
 impl<S, C> KtlsImplementation for KtlsDuplexStream<S, C>
@@ -164,11 +45,17 @@ where
     C: TlsSession,
 {
     type Stream = S;
+    type StreamRef<'a>
+        = &'a mut S
+    where
+        Self: 'a;
 
-    fn stream(&mut self) -> io::Result<&mut Self::Stream> {
-        self.inner
-            .as_mut()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "stream is closed"))
+    async fn incoming_stream(&mut self) -> io::Result<&mut S> {
+        self.stream()
+    }
+
+    async fn outgoing_stream(&mut self) -> io::Result<&mut S> {
+        self.stream()
     }
 
     fn close(&mut self) {
@@ -210,9 +97,10 @@ where
                 break BufResult(Ok(0), buf);
             }
 
-            let stream;
-            (stream, buf) = buf_try!(self.stream(), buf);
-            let BufResult(res, b) = stream.read(buf).await;
+            let BufResult(res, b) = {
+                let (stream, b) = buf_try!(self.stream(), buf);
+                stream.read(b).await
+            };
             match res {
                 Ok(len) => break BufResult(Ok(len), b),
                 Err(e) if e.raw_os_error() == Some(libc::EIO) => {
@@ -232,9 +120,10 @@ where
                 break BufResult(Ok(0), buf);
             }
 
-            let stream;
-            (stream, buf) = buf_try!(self.stream(), buf);
-            let BufResult(res, b) = stream.read_vectored(buf).await;
+            let BufResult(res, b) = {
+                let (stream, b) = buf_try!(self.stream(), buf);
+                stream.read_vectored(b).await
+            };
             match res {
                 Ok(len) => break BufResult(Ok(len), b),
                 Err(e) if e.raw_os_error() == Some(libc::EIO) => {
@@ -256,8 +145,8 @@ where
 {
     async fn write<T: IoBuf>(&mut self, buf: T) -> BufResult<usize, T> {
         if self.outgoing_state.is_open() {
-            let (stream, buf) = buf_try!(self.stream(), buf);
             let res = {
+                let (stream, buf) = buf_try!(self.stream(), buf);
                 #[cfg(not(feature = "app-write-with-empty-ancillary"))]
                 {
                     stream.write(buf).await
@@ -282,8 +171,8 @@ where
 
     async fn write_vectored<T: IoVectoredBuf>(&mut self, buf: T) -> BufResult<usize, T> {
         if self.outgoing_state.is_open() {
-            let (stream, buf) = buf_try!(self.stream(), buf);
             let res = {
+                let (stream, buf) = buf_try!(self.stream(), buf);
                 #[cfg(not(feature = "app-write-with-empty-ancillary"))]
                 {
                     stream.write_vectored(buf).await
@@ -317,7 +206,7 @@ where
     }
 
     async fn shutdown(&mut self) -> io::Result<()> {
-        use OutgoingState::*;
+        use crate::linux::stream::OutgoingState::*;
 
         let res = match self.outgoing_state {
             // First, send the `close_notify` alert
@@ -359,6 +248,7 @@ where
                 .map(|()| self.outgoing_state = Closed),
 
             Err(e) => match self.inspect_error(e).await {
+                // inspect_error() can only return Err()
                 Ok(()) => unreachable!(),
 
                 // write() or flush() may fail with an Interrupted or WouldBlock error, in which
@@ -377,6 +267,20 @@ where
                 }
             },
         }
+    }
+}
+
+impl<S, C> KtlsDuplexStream<S, C>
+where
+    S: Clone,
+{
+    pub(crate) fn split(self) -> (ReadHalf<S, C>, WriteHalf<S, C>) {
+        split::new(
+            self.inner,
+            self.session,
+            self.incoming_closed,
+            self.outgoing_state,
+        )
     }
 }
 

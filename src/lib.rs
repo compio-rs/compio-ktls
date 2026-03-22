@@ -13,7 +13,7 @@
 //! # use std::sync::Arc;
 //! #
 //! use compio::{
-//!     io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
+//!     io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, util::Splittable},
 //!     net::TcpStream,
 //!     tls::TlsConnector,
 //! };
@@ -33,18 +33,33 @@
 //! let connector = KtlsConnector::from(config.clone());
 //!
 //! // Connect to a TLS server
-//! let hostname = "github.com";
+//! let hostname = "www.google.com";
 //! let mut tcp_stream = TcpStream::connect(format!("{hostname}:443")).await.unwrap();
 //!
 //! // Attempt to upgrade to kTLS
 //! let request = format!("GET / HTTP/1.0\r\nHost: {hostname}\r\n\r\n");
 //! match connector.connect(hostname, tcp_stream).await.unwrap() {
-//!     Ok(mut stream) => {
-//!         // kTLS enabled successfully
-//!         stream.write_all(request.as_bytes().to_vec()).await.unwrap();
-//!         stream.flush().await.unwrap();
-//!         let (_len, _html) = stream.read_to_end(vec![]).await.unwrap();
-//!         stream.shutdown().await.unwrap();
+//!     Ok(stream) => {
+//!         // kTLS enabled successfully, split read and write
+//!         let (mut reader, mut writer) = stream.split();
+//!
+//!         // Demonstrates that concurrent read doesn't block writes
+//!         let read_task =
+//!             compio::runtime::spawn(async move { reader.read_to_end(vec![]).await.unwrap() });
+//!
+//!         // Now send the HTTP request
+//!         writer.write_all(request.as_bytes().to_vec()).await.unwrap();
+//!         writer.flush().await.unwrap();
+//!         writer.shutdown().await.unwrap();
+//!
+//!         // Collect the read result
+//!         let (len, html) = read_task.await.unwrap();
+//!         eprintln!(
+//!             "Received {len} bytes:\n{}",
+//!             String::from_utf8_lossy(&html[..64])
+//!         );
+//!         assert!(len > 0);
+//!         assert!(html.starts_with(b"HTTP/1.0 "));
 //!     }
 //!     Err(stream) => {
 //!         // kTLS unavailable, fallback to original stream

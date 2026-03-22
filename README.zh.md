@@ -14,6 +14,7 @@
 - 可插拔的 TLS 实现（目前支持 Rustls）
 - 目前仅支持 TLS 1.3
 - 支持 NewSessionTicket、KeyUpdate 和 Alert 消息处理
+- 支持读写分离（不是那种读写互斥式的），实现真正意义上的并发 I/O
 
 ## 可选 features
 
@@ -23,8 +24,9 @@
   `write()`。compio-rs/compio#756 引入了 io-uring 的零拷贝写入，改变了 `write()`
   的默认行为，而这会在启用了 kTLS 的 socket 上出错。因此，使用 io-uring 时，应启用该 feature
   来绕过 zero-copy 写入与 kTLS 的冲突。
+- `sync`：单线程无须开启，多线程才需要。仅对读写分离有用。
 
-（所以基本上就是，除非你自己指定 `compio/polling`，不然所有 feature 都得启用就对了）
+（所以基本上就是，除非你自己指定 `compio/polling`，不然所有 feature 都得启用就对了，除了 `sync`）
 
 ## 使用方法
 
@@ -53,6 +55,17 @@ match acceptor.accept(tcp_stream).await? {
     }
 }
 ```
+
+可以将 `KtlsStream` 拆分为“独立”的读、写两半，在不同的协程上并发使用：
+
+```rust
+use compio::io::util::Splittable;
+
+let (mut reader, mut writer) = stream.split();
+// 现在 reader 和 writer 可以并发使用
+```
+
+除了比如 KeyUpdate 这种内部处理的特殊消息之外，读写两半之间没有任何交互了，所以不需要担心死锁问题。
 
 ## 环境要求
 
