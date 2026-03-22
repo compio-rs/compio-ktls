@@ -24,6 +24,8 @@
   的默认行为，而这会在启用了 kTLS 的 socket 上出错。因此，使用 io-uring 时，应启用该 feature
   来绕过 zero-copy 写入与 kTLS 的冲突。
 
+（所以基本上就是，除非你自己指定 `compio/polling`，不然所有 feature 都得启用就对了）
+
 ## 使用方法
 
 ```rust
@@ -83,6 +85,12 @@ config.enable_secret_extraction = true;
 
 let config = Arc::new(config);
 ```
+
+## 致谢
+
+- 我大幅参考了 [ktls-core](https://github.com/hanyu-dev/ktls) 的实现，但介于 I/O 不兼容无法 100%
+  直接用，所以很多东西只能重写一遍，致谢的同时，许愿之后能合并到上游！
+- `adaptor.rs` 是仿照 [compio-tls](https://github.com/compio-rs/compio/tree/main/compio-tls) 来做的。
 
 ## 许可证
 
