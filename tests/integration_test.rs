@@ -80,8 +80,6 @@ mod ktls_tests {
     /// Test kTLS server accepting connections from regular TLS client
     #[compio::test]
     async fn test_ktls_server_from_tls_client() {
-        eprintln!("[TEST] Starting test_ktls_server_from_tls_client");
-
         // Load test certificates
         let cert_pem = std::fs::read("tests/fixtures/cert.pem").unwrap();
         let key_pem = std::fs::read("tests/fixtures/key.pem").unwrap();
@@ -98,51 +96,35 @@ mod ktls_tests {
             .unwrap();
         server_config.enable_secret_extraction = true;
 
-        eprintln!("[TEST] Server config created");
-
         // Start kTLS server
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        eprintln!("[TEST] Server listening on {}", addr);
 
         // Spawn server task
         compio::runtime::spawn(async move {
-            eprintln!("[SERVER] Waiting for connection...");
             let (stream, _) = listener.accept().await.unwrap();
-            eprintln!("[SERVER] Connection accepted");
 
             let acceptor = KtlsAcceptor::from(Arc::new(server_config));
-            eprintln!("[SERVER] Starting kTLS accept...");
             let result = acceptor.accept(stream).await.unwrap();
-            eprintln!("[SERVER] kTLS accept completed: {:?}", result.is_ok());
 
             match result {
                 Ok(mut ktls_stream) => {
-                    eprintln!("[SERVER] Reading data...");
                     let buf = vec![0u8; 1024];
                     let (n, buf) = ktls_stream.read(buf).await.unwrap();
-                    eprintln!("[SERVER] Read {} bytes", n);
 
-                    eprintln!("[SERVER] Writing data back...");
                     ktls_stream.write_all(buf[..n].to_vec()).await.unwrap();
                     ktls_stream.flush().await.unwrap();
-                    eprintln!("[SERVER] Data written, shutting down...");
 
                     ktls_stream.shutdown().await.ok();
-                    eprintln!("[SERVER] Server shutdown complete");
                 }
                 Err(mut stream) => {
-                    eprintln!("[SERVER] kTLS not available, using fallback");
                     stream.shutdown().await.ok();
                 }
             }
         })
         .detach();
 
-        eprintln!("[TEST] Server task spawned");
-
         // Connect as client (in main task)
-        eprintln!("[CLIENT] Connecting to {}...", addr);
         let client_config = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoVerifier))
@@ -150,27 +132,18 @@ mod ktls_tests {
 
         let connector = TlsConnector::from(Arc::new(client_config));
         let stream = TcpStream::connect(addr).await.unwrap();
-        eprintln!("[CLIENT] TCP connected");
 
         let mut stream = connector.connect("localhost", stream).await.unwrap();
-        eprintln!("[CLIENT] TLS handshake completed");
 
         // Send and receive
         let msg = b"Hello from client!";
-        eprintln!("[CLIENT] Sending message...");
         stream.write_all(msg.to_vec()).await.unwrap();
         stream.flush().await.unwrap();
-        eprintln!("[CLIENT] Message sent, reading response...");
 
         let (n, buf) = stream.read(vec![0u8; 1024]).await.unwrap();
-        eprintln!("[CLIENT] Read {} bytes", n);
-
         assert_eq!(&buf[..n], msg);
-        eprintln!("[CLIENT] Data verified, shutting down...");
 
         stream.shutdown().await.ok();
-        eprintln!("[CLIENT] Client shutdown complete");
-        eprintln!("[TEST] Test completed successfully");
     }
 
     /// Test full kTLS: both client and server use kTLS
