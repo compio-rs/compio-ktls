@@ -96,7 +96,7 @@ impl KtlsConnector {
                     .await?
                 }
                 #[cfg(not(feature = "rustls"))]
-                KtlsConnectorInner::None(_) => unreachable!(),
+                KtlsConnectorInner::None(v) => match *v {},
             })),
             Err(e) if e.is_ktls_unsupported() => Ok(Err(stream)),
             Err(ktls_core::Error::Ulp(e)) => Err(e),
@@ -221,7 +221,7 @@ impl KtlsAcceptor {
                 #[cfg(feature = "rustls")]
                 KtlsAcceptorInner::Rustls(c) => super::rtls::accept_ktls(c.clone(), stream).await?,
                 #[cfg(not(feature = "rustls"))]
-                KtlsAcceptorInner::None(_) => unreachable!(),
+                KtlsAcceptorInner::None(v) => match *v {},
             })),
             Err(e) if e.is_ktls_unsupported() => Ok(Err(stream)),
             Err(ktls_core::Error::Ulp(e)) => Err(e),

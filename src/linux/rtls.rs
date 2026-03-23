@@ -103,10 +103,14 @@ where
                             unsafe { outgoing_tls.set_len(outgoing_tls.len() + len) };
                             break;
                         }
-                        Err(EncodeError::InsufficientSize(e)) if first => {
-                            outgoing_tls.reserve(e.required_size)
+                        Err(EncodeError::InsufficientSize(e)) => {
+                            if first {
+                                outgoing_tls.reserve(e.required_size)
+                            } else {
+                                unreachable!("insufficient size after reserve()");
+                            }
                         }
-                        Err(_) => unreachable!(),
+                        Err(EncodeError::AlreadyEncoded) => unreachable!("encoded twice"),
                     }
                 }
             }
