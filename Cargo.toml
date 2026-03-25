@@ -40,13 +40,13 @@ rustls-native-certs = "0.8"
 rustls-pemfile = "2.2"
 
 [patch.crates-io.compio]
-git = "https://github.com/fantix/compio.git"
-rev = "a40dbc4685898f61f8a6702da9aa38872e5f7629"
+git = "https://github.com/compio-rs/compio.git"
+rev = "ffb642c7061d2146c719534e8e6ee877ffc25bcf"
 
 [patch.crates-io.compio-io]
-git = "https://github.com/fantix/compio.git"
-rev = "a40dbc4685898f61f8a6702da9aa38872e5f7629"
+git = "https://github.com/compio-rs/compio.git"
+rev = "ffb642c7061d2146c719534e8e6ee877ffc25bcf"
 
 [patch.crates-io.compio-buf]
-git = "https://github.com/fantix/compio.git"
-rev = "a40dbc4685898f61f8a6702da9aa38872e5f7629"
+git = "https://github.com/compio-rs/compio.git"
+rev = "ffb642c7061d2146c719534e8e6ee877ffc25bcf"
