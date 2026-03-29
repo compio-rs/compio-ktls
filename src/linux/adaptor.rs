@@ -58,7 +58,12 @@ pub struct KtlsConnector(KtlsConnectorInner);
 enum KtlsConnectorInner {
     #[cfg(feature = "rustls")]
     Rustls(Arc<rustls::ClientConfig>),
-    #[cfg(not(feature = "rustls"))]
+    #[cfg(feature = "openssl")]
+    OpenSsl {
+        connector: Arc<openssl::ssl::SslConnector>,
+        memmem_mode: Option<super::ossl::MemmemMode>,
+    },
+    #[cfg(not(any(feature = "rustls", feature = "openssl")))]
     None(std::convert::Infallible),
 }
 
@@ -66,6 +71,16 @@ enum KtlsConnectorInner {
 impl From<Arc<rustls::ClientConfig>> for KtlsConnector {
     fn from(c: Arc<rustls::ClientConfig>) -> Self {
         Self(KtlsConnectorInner::Rustls(c))
+    }
+}
+
+#[cfg(feature = "openssl")]
+impl From<Arc<openssl::ssl::SslConnector>> for KtlsConnector {
+    fn from(connector: Arc<openssl::ssl::SslConnector>) -> Self {
+        Self(KtlsConnectorInner::OpenSsl {
+            connector,
+            memmem_mode: None,
+        })
     }
 }
 
@@ -81,7 +96,9 @@ impl KtlsConnector {
                     return Ok(Err(stream));
                 }
             }
-            #[cfg(not(feature = "rustls"))]
+            #[cfg(feature = "openssl")]
+            KtlsConnectorInner::OpenSsl { .. } => {}
+            #[cfg(not(any(feature = "rustls", feature = "openssl")))]
             KtlsConnectorInner::None(_) => return Ok(Err(stream)),
         }
         match ktls_core::setup_ulp(&stream) {
@@ -95,13 +112,28 @@ impl KtlsConnector {
                     )
                     .await?
                 }
-                #[cfg(not(feature = "rustls"))]
+                #[cfg(feature = "openssl")]
+                KtlsConnectorInner::OpenSsl {
+                    connector: c,
+                    memmem_mode: mode,
+                } => {
+                    let mode = mode.unwrap_or(super::ossl::MemmemMode::Fork);
+                    super::ossl::connect_ktls(c.clone(), domain, stream, mode).await?
+                }
+                #[cfg(not(any(feature = "rustls", feature = "openssl")))]
                 KtlsConnectorInner::None(v) => match *v {},
             })),
             Err(e) if e.is_ktls_unsupported() => Ok(Err(stream)),
             Err(ktls_core::Error::Ulp(e)) => Err(e),
             // Only Ulp variant can be returned from setup_ulp
             _ => unreachable!(),
+        }
+    }
+
+    #[cfg(feature = "openssl")]
+    pub fn set_memmem_mode(&mut self, mode: super::ossl::MemmemMode) {
+        if let KtlsConnectorInner::OpenSsl { memmem_mode, .. } = &mut self.0 {
+            *memmem_mode = Some(mode);
         }
     }
 }
@@ -190,7 +222,12 @@ pub struct KtlsAcceptor(KtlsAcceptorInner);
 enum KtlsAcceptorInner {
     #[cfg(feature = "rustls")]
     Rustls(Arc<rustls::server::ServerConfig>),
-    #[cfg(not(feature = "rustls"))]
+    #[cfg(feature = "openssl")]
+    OpenSsl {
+        acceptor: Arc<openssl::ssl::SslAcceptor>,
+        memmem_mode: Option<super::ossl::MemmemMode>,
+    },
+    #[cfg(not(any(feature = "rustls", feature = "openssl")))]
     None(std::convert::Infallible),
 }
 
@@ -198,6 +235,16 @@ enum KtlsAcceptorInner {
 impl From<Arc<rustls::server::ServerConfig>> for KtlsAcceptor {
     fn from(c: Arc<rustls::server::ServerConfig>) -> Self {
         Self(KtlsAcceptorInner::Rustls(c))
+    }
+}
+
+#[cfg(feature = "openssl")]
+impl From<Arc<openssl::ssl::SslAcceptor>> for KtlsAcceptor {
+    fn from(acceptor: Arc<openssl::ssl::SslAcceptor>) -> Self {
+        Self(KtlsAcceptorInner::OpenSsl {
+            acceptor,
+            memmem_mode: None,
+        })
     }
 }
 
@@ -213,20 +260,37 @@ impl KtlsAcceptor {
                     return Ok(Err(stream));
                 }
             }
-            #[cfg(not(feature = "rustls"))]
+            #[cfg(feature = "openssl")]
+            KtlsAcceptorInner::OpenSsl { .. } => {}
+            #[cfg(not(any(feature = "rustls", feature = "openssl")))]
             KtlsAcceptorInner::None(_) => return Ok(Err(stream)),
         }
         match ktls_core::setup_ulp(&stream) {
             Ok(()) => Ok(Ok(match &self.0 {
                 #[cfg(feature = "rustls")]
                 KtlsAcceptorInner::Rustls(c) => super::rtls::accept_ktls(c.clone(), stream).await?,
-                #[cfg(not(feature = "rustls"))]
+                #[cfg(feature = "openssl")]
+                KtlsAcceptorInner::OpenSsl {
+                    acceptor,
+                    memmem_mode: mode,
+                } => {
+                    let mode = mode.unwrap_or(super::ossl::MemmemMode::Fork);
+                    super::ossl::accept_ktls(acceptor.clone(), stream, mode).await?
+                }
+                #[cfg(not(any(feature = "rustls", feature = "openssl")))]
                 KtlsAcceptorInner::None(v) => match *v {},
             })),
             Err(e) if e.is_ktls_unsupported() => Ok(Err(stream)),
             Err(ktls_core::Error::Ulp(e)) => Err(e),
             // Only Ulp variant can be returned from setup_ulp
             _ => unreachable!(),
+        }
+    }
+
+    #[cfg(feature = "openssl")]
+    pub fn set_memmem_mode(&mut self, mode: super::ossl::MemmemMode) {
+        if let KtlsAcceptorInner::OpenSsl { memmem_mode, .. } = &mut self.0 {
+            *memmem_mode = Some(mode);
         }
     }
 }
@@ -237,6 +301,8 @@ type RustlsClientConnection<S> =
 #[cfg(feature = "rustls")]
 type RustlsServerConnection<S> =
     KtlsDuplexStream<S, rustls::kernel::KernelConnection<rustls::server::ServerConnectionData>>;
+#[cfg(feature = "openssl")]
+type OpenSslConnection<S> = KtlsDuplexStream<S, super::ossl::KtlsSession<S>>;
 
 /// A kTLS stream that encrypts/decrypts data in the Linux kernel.
 ///
@@ -253,7 +319,9 @@ enum KtlsStreamInner<S> {
     RustlsClient(RustlsClientConnection<S>),
     #[cfg(feature = "rustls")]
     RustlsServer(RustlsServerConnection<S>),
-    #[cfg(not(feature = "rustls"))]
+    #[cfg(feature = "openssl")]
+    OpenSsl(OpenSslConnection<S>),
+    #[cfg(not(any(feature = "rustls", feature = "openssl")))]
     None(std::convert::Infallible, std::marker::PhantomData<S>),
 }
 
@@ -271,6 +339,13 @@ impl<S> From<RustlsServerConnection<S>> for KtlsStream<S> {
     }
 }
 
+#[cfg(feature = "openssl")]
+impl<S> From<OpenSslConnection<S>> for KtlsStream<S> {
+    fn from(s: OpenSslConnection<S>) -> Self {
+        Self(KtlsStreamInner::OpenSsl(s))
+    }
+}
+
 impl<S> AsyncRead for KtlsStream<S>
 where
     S: AsyncRead + AsyncWrite + AsyncReadAncillary + AsyncWriteAncillary + AsFd,
@@ -281,7 +356,9 @@ where
             KtlsStreamInner::RustlsClient(s) => s.read(buf).await,
             #[cfg(feature = "rustls")]
             KtlsStreamInner::RustlsServer(s) => s.read(buf).await,
-            #[cfg(not(feature = "rustls"))]
+            #[cfg(feature = "openssl")]
+            KtlsStreamInner::OpenSsl(s) => s.read(buf).await,
+            #[cfg(not(any(feature = "rustls", feature = "openssl")))]
             KtlsStreamInner::None(f, ..) => match *f {},
         }
     }
@@ -292,7 +369,9 @@ where
             KtlsStreamInner::RustlsClient(s) => s.read_vectored(buf).await,
             #[cfg(feature = "rustls")]
             KtlsStreamInner::RustlsServer(s) => s.read_vectored(buf).await,
-            #[cfg(not(feature = "rustls"))]
+            #[cfg(feature = "openssl")]
+            KtlsStreamInner::OpenSsl(s) => s.read_vectored(buf).await,
+            #[cfg(not(any(feature = "rustls", feature = "openssl")))]
             KtlsStreamInner::None(f, ..) => match *f {},
         }
     }
@@ -308,7 +387,9 @@ where
             KtlsStreamInner::RustlsClient(s) => s.write(buf).await,
             #[cfg(feature = "rustls")]
             KtlsStreamInner::RustlsServer(s) => s.write(buf).await,
-            #[cfg(not(feature = "rustls"))]
+            #[cfg(feature = "openssl")]
+            KtlsStreamInner::OpenSsl(s) => s.write(buf).await,
+            #[cfg(not(any(feature = "rustls", feature = "openssl")))]
             KtlsStreamInner::None(f, ..) => match *f {},
         }
     }
@@ -319,7 +400,9 @@ where
             KtlsStreamInner::RustlsClient(s) => s.write_vectored(buf).await,
             #[cfg(feature = "rustls")]
             KtlsStreamInner::RustlsServer(s) => s.write_vectored(buf).await,
-            #[cfg(not(feature = "rustls"))]
+            #[cfg(feature = "openssl")]
+            KtlsStreamInner::OpenSsl(s) => s.write_vectored(buf).await,
+            #[cfg(not(any(feature = "rustls", feature = "openssl")))]
             KtlsStreamInner::None(f, ..) => match *f {},
         }
     }
@@ -330,7 +413,9 @@ where
             KtlsStreamInner::RustlsClient(s) => s.flush().await,
             #[cfg(feature = "rustls")]
             KtlsStreamInner::RustlsServer(s) => s.flush().await,
-            #[cfg(not(feature = "rustls"))]
+            #[cfg(feature = "openssl")]
+            KtlsStreamInner::OpenSsl(s) => s.flush().await,
+            #[cfg(not(any(feature = "rustls", feature = "openssl")))]
             KtlsStreamInner::None(f, ..) => match *f {},
         }
     }
@@ -341,7 +426,9 @@ where
             KtlsStreamInner::RustlsClient(s) => s.shutdown().await,
             #[cfg(feature = "rustls")]
             KtlsStreamInner::RustlsServer(s) => s.shutdown().await,
-            #[cfg(not(feature = "rustls"))]
+            #[cfg(feature = "openssl")]
+            KtlsStreamInner::OpenSsl(s) => s.shutdown().await,
+            #[cfg(not(any(feature = "rustls", feature = "openssl")))]
             KtlsStreamInner::None(f, ..) => match *f {},
         }
     }
@@ -370,7 +457,14 @@ where
                 let w = KtlsWriteHalf(KtlsWriteHalfInner::RustlsServer(w));
                 (r, w)
             }
-            #[cfg(not(feature = "rustls"))]
+            #[cfg(feature = "openssl")]
+            KtlsStreamInner::OpenSsl(s) => {
+                let (r, w) = s.split();
+                let r = KtlsReadHalf(KtlsReadHalfInner::OpenSsl(r));
+                let w = KtlsWriteHalf(KtlsWriteHalfInner::OpenSsl(w));
+                (r, w)
+            }
+            #[cfg(not(any(feature = "rustls", feature = "openssl")))]
             KtlsStreamInner::None(f, ..) => match *f {},
         }
     }
@@ -384,13 +478,17 @@ type RustlsClientReadHalf<S> =
 #[cfg(feature = "rustls")]
 type RustlsServerReadHalf<S> =
     ReadHalf<S, rustls::kernel::KernelConnection<rustls::server::ServerConnectionData>>;
+#[cfg(feature = "openssl")]
+type OpenSslReadHalf<S> = ReadHalf<S, super::ossl::KtlsSession<S>>;
 
 enum KtlsReadHalfInner<S> {
     #[cfg(feature = "rustls")]
     RustlsClient(RustlsClientReadHalf<S>),
     #[cfg(feature = "rustls")]
     RustlsServer(RustlsServerReadHalf<S>),
-    #[cfg(not(feature = "rustls"))]
+    #[cfg(feature = "openssl")]
+    OpenSsl(OpenSslReadHalf<S>),
+    #[cfg(not(any(feature = "rustls", feature = "openssl")))]
     None(std::convert::Infallible, std::marker::PhantomData<S>),
 }
 
@@ -404,7 +502,9 @@ where
             KtlsReadHalfInner::RustlsClient(s) => s.read(buf).await,
             #[cfg(feature = "rustls")]
             KtlsReadHalfInner::RustlsServer(s) => s.read(buf).await,
-            #[cfg(not(feature = "rustls"))]
+            #[cfg(feature = "openssl")]
+            KtlsReadHalfInner::OpenSsl(s) => s.read(buf).await,
+            #[cfg(not(any(feature = "rustls", feature = "openssl")))]
             KtlsReadHalfInner::None(f, ..) => match *f {},
         }
     }
@@ -415,7 +515,9 @@ where
             KtlsReadHalfInner::RustlsClient(s) => s.read_vectored(buf).await,
             #[cfg(feature = "rustls")]
             KtlsReadHalfInner::RustlsServer(s) => s.read_vectored(buf).await,
-            #[cfg(not(feature = "rustls"))]
+            #[cfg(feature = "openssl")]
+            KtlsReadHalfInner::OpenSsl(s) => s.read_vectored(buf).await,
+            #[cfg(not(any(feature = "rustls", feature = "openssl")))]
             KtlsReadHalfInner::None(f, ..) => match *f {},
         }
     }
@@ -429,13 +531,17 @@ type RustlsClientWriteHalf<S> =
 #[cfg(feature = "rustls")]
 type RustlsServerWriteHalf<S> =
     WriteHalf<S, rustls::kernel::KernelConnection<rustls::server::ServerConnectionData>>;
+#[cfg(feature = "openssl")]
+type OpenSslWriteHalf<S> = WriteHalf<S, super::ossl::KtlsSession<S>>;
 
 enum KtlsWriteHalfInner<S> {
     #[cfg(feature = "rustls")]
     RustlsClient(RustlsClientWriteHalf<S>),
     #[cfg(feature = "rustls")]
     RustlsServer(RustlsServerWriteHalf<S>),
-    #[cfg(not(feature = "rustls"))]
+    #[cfg(feature = "openssl")]
+    OpenSsl(OpenSslWriteHalf<S>),
+    #[cfg(not(any(feature = "rustls", feature = "openssl")))]
     None(std::convert::Infallible, std::marker::PhantomData<S>),
 }
 
@@ -449,7 +555,9 @@ where
             KtlsWriteHalfInner::RustlsClient(s) => s.write(buf).await,
             #[cfg(feature = "rustls")]
             KtlsWriteHalfInner::RustlsServer(s) => s.write(buf).await,
-            #[cfg(not(feature = "rustls"))]
+            #[cfg(feature = "openssl")]
+            KtlsWriteHalfInner::OpenSsl(s) => s.write(buf).await,
+            #[cfg(not(any(feature = "rustls", feature = "openssl")))]
             KtlsWriteHalfInner::None(f, ..) => match *f {},
         }
     }
@@ -460,7 +568,9 @@ where
             KtlsWriteHalfInner::RustlsClient(s) => s.write_vectored(buf).await,
             #[cfg(feature = "rustls")]
             KtlsWriteHalfInner::RustlsServer(s) => s.write_vectored(buf).await,
-            #[cfg(not(feature = "rustls"))]
+            #[cfg(feature = "openssl")]
+            KtlsWriteHalfInner::OpenSsl(s) => s.write_vectored(buf).await,
+            #[cfg(not(any(feature = "rustls", feature = "openssl")))]
             KtlsWriteHalfInner::None(f, ..) => match *f {},
         }
     }
@@ -471,7 +581,9 @@ where
             KtlsWriteHalfInner::RustlsClient(s) => s.flush().await,
             #[cfg(feature = "rustls")]
             KtlsWriteHalfInner::RustlsServer(s) => s.flush().await,
-            #[cfg(not(feature = "rustls"))]
+            #[cfg(feature = "openssl")]
+            KtlsWriteHalfInner::OpenSsl(s) => s.flush().await,
+            #[cfg(not(any(feature = "rustls", feature = "openssl")))]
             KtlsWriteHalfInner::None(f, ..) => match *f {},
         }
     }
@@ -482,7 +594,9 @@ where
             KtlsWriteHalfInner::RustlsClient(s) => s.shutdown().await,
             #[cfg(feature = "rustls")]
             KtlsWriteHalfInner::RustlsServer(s) => s.shutdown().await,
-            #[cfg(not(feature = "rustls"))]
+            #[cfg(feature = "openssl")]
+            KtlsWriteHalfInner::OpenSsl(s) => s.shutdown().await,
+            #[cfg(not(any(feature = "rustls", feature = "openssl")))]
             KtlsWriteHalfInner::None(f, ..) => match *f {},
         }
     }

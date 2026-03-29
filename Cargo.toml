@@ -13,6 +13,7 @@ readme = "README.md"
 [dependencies]
 rustls = { version = "0.23", default-features = false, optional = true }
 synchrony = { version = "0.1", features = ["bilock"] }
+openssl = { version = "0.10", optional = true }
 
 [dependencies.compio-io]
 version = "0.9"
@@ -31,6 +32,7 @@ ktls-core = "0.0.5"
 default = ["rustls"]
 rustls = ["dep:rustls", "ktls-core/shim-rustls"]
 ring = ["rustls", "rustls/ring"]
+openssl = ["dep:openssl"]
 app-write-with-empty-ancillary = []
 sync = []
 
