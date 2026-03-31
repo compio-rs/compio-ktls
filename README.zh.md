@@ -19,6 +19,7 @@
 ## 可选 features
 
 - `rustls`（默认）：启用 Rustls 集成
+- `openssl`：启用 OpenSSL 集成。使用 `openssl` crate，需要系统已安装 OpenSSL。
 - `ring`：使用 ring 作为加密后端
 - `app-write-with-empty-ancillary`：在写入应用数据时使用 `write_with_ancillary()` 而非
   `write()`。compio-rs/compio#756 引入了 io-uring 的零拷贝写入，改变了 `write()`
@@ -101,6 +102,29 @@ let mut config = ClientConfig::builder()
 config.enable_secret_extraction = true;
 
 let config = Arc::new(config);
+```
+
+### OpenSSL
+
+使用 `openssl` feature 时，compio-ktls 需要从 OpenSSL 的 `SSL` 结构体中提取 TLS traffic
+secrets 来配置 kTLS。由于 OpenSSL 没有提供公开 API，本库直接在结构体内存中搜索 secrets——通过
+**`MemmemMode`** 设置来控制搜索方式：
+
+| 模式 | 工作方式 | 权衡                                        |
+|------|---------|-------------------------------------------|
+| `Fork`（默认） | fork 子进程安全地扫描 `SSL` 结构体内存 | 安全；不依赖分配器实现                               |
+| `AssumeLibc` | 通过 `malloc_usable_size` 获取可读范围，在进程内直接扫描 | 无需 fork，但要求 OpenSSL 使用 libc `malloc` 分配内存 |
+| `AssumeLibcAndFork` | 用 `malloc_usable_size` 确定可读范围（同 `AssumeLibc`），但通过 fork 扫描（同 `Fork`） | 比纯 `Fork` 读取边界更精确，同时 fork 保证安全            |
+
+探测到的 offset 会全局缓存（`OnceLock`），开销只在第一次连接时产生，后续连接直接复用缓存结果。
+
+默认使用 `Fork`，开箱即用。如需切换，可以通过 `set_memmem_mode` 设置：
+
+```rust
+use compio_ktls::{KtlsConnector, MemmemMode};
+
+let mut connector = KtlsConnector::from(ssl_connector);
+connector.set_memmem_mode(MemmemMode::AssumeLibc);
 ```
 
 ## 致谢

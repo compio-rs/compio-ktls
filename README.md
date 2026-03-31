@@ -19,6 +19,8 @@ Kernel TLS (kTLS) support for [Compio](https://github.com/compio-rs/compio).
 ## Features
 
 - `rustls` (default): Enable Rustls integration
+- `openssl`: Enable OpenSSL integration. This uses the `openssl` crate and requires OpenSSL
+  to be installed on the system.
 - `ring`: Use ring as the crypto backend
 - `app-write-with-empty-ancillary`: Use `write_with_ancillary()` instead of `write()` for
   application data writes. compio-rs/compio#756 introduced zero-copy writes for io-uring,
@@ -103,6 +105,32 @@ let mut config = ClientConfig::builder()
 config.enable_secret_extraction = true;
 
 let config = Arc::new(config);
+```
+
+### OpenSSL
+
+When using the `openssl` feature, compio-ktls needs to extract TLS traffic secrets from the
+OpenSSL `SSL` struct in order to configure kTLS. Because OpenSSL does not expose a public API
+for this, the library searches for the secrets directly in the struct's memory — this is
+controlled by the **`MemmemMode`** setting:
+
+| Mode | How it works | Trade-off |
+|------|-------------|-----------|
+| `Fork` (default) | Forks a child process to safely scan the `SSL` struct memory | Safe; assumes nothing about the allocator |
+| `AssumeLibc` | Uses `malloc_usable_size` to determine the readable range, then scans in-process | No fork, but assumes OpenSSL allocates with libc `malloc` |
+| `AssumeLibcAndFork` | Uses `malloc_usable_size` for the readable range (like `AssumeLibc`), but scans via fork (like `Fork`) | Tighter read bound than pure `Fork`, still fork-safe |
+
+The probed offsets are cached globally (`OnceLock`), so the cost is only paid once — on the
+first connection. Subsequent connections reuse the cached result regardless of mode.
+
+The default is `Fork`, which works out of the box. You can switch to a different mode with
+`set_memmem_mode`:
+
+```rust
+use compio_ktls::{KtlsConnector, MemmemMode};
+
+let mut connector = KtlsConnector::from(ssl_connector);
+connector.set_memmem_mode(MemmemMode::AssumeLibc);
 ```
 
 ## License
