@@ -97,7 +97,12 @@ impl KtlsConnector {
                 }
             }
             #[cfg(feature = "openssl")]
-            KtlsConnectorInner::OpenSsl { .. } => {}
+            KtlsConnectorInner::OpenSsl { memmem_mode, .. } => {
+                let mode = memmem_mode.unwrap_or(super::ossl::MemmemMode::Fork);
+                if super::ossl::probe_tls13_secret_offsets(mode).is_err() {
+                    return Ok(Err(stream));
+                }
+            }
             #[cfg(not(any(feature = "rustls", feature = "openssl")))]
             KtlsConnectorInner::None(_) => return Ok(Err(stream)),
         }
@@ -146,52 +151,45 @@ impl KtlsConnector {
 /// # Example
 ///
 /// ```
-/// # use std::{fs, sync::Arc};
+/// # use std::sync::Arc;
 /// #
-/// use compio::{io::AsyncWrite, net::TcpListener, tls::TlsAcceptor};
+/// use compio::{io::AsyncWrite, net::TcpListener};
 /// use compio_ktls::KtlsAcceptor;
+/// use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
 ///
 /// # compio::runtime::Runtime::new().unwrap().block_on(async {
 /// #
-/// # // Load test certificates
-/// # let cert_pem = fs::read("tests/fixtures/cert.pem").unwrap();
-/// # let key_pem = fs::read("tests/fixtures/key.pem").unwrap();
-/// # let certs = rustls_pemfile::certs(&mut cert_pem.as_slice())
-/// #     .collect::<Result<Vec<_>, _>>()
-/// #     .unwrap();
-/// # let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
-/// #     .unwrap()
-/// #     .unwrap();
-/// #
-/// // Setup rustls server config with secret extraction enabled
-/// let mut config = rustls::server::ServerConfig::builder()
-///     .with_no_client_auth()
-///     .with_single_cert(certs, key)
+/// // Setup OpenSSL server config
+/// let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server()).unwrap();
+/// builder
+///     .set_certificate_chain_file("tests/fixtures/cert.pem")
 ///     .unwrap();
-/// config.enable_secret_extraction = true;
-/// let config = Arc::new(config);
+/// builder
+///     .set_private_key_file("tests/fixtures/key.pem", SslFiletype::PEM)
+///     .unwrap();
+/// let ssl_acceptor = Arc::new(builder.build());
 ///
 /// // Start a server
 /// let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 ///
 /// # let addr = listener.local_addr().unwrap();
 /// # compio::runtime::spawn(async move {
-/// #     use compio::{net::TcpStream, tls::TlsConnector};
+/// #     use compio::net::TcpStream;
+/// #     use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 /// #
-/// #     let mut client_config = rustls::ClientConfig::builder()
-/// #         .dangerous()
-/// #         .with_custom_certificate_verifier(Arc::new(NoVerifier))
-/// #         .with_no_client_auth();
+/// #     let mut builder = SslConnector::builder(SslMethod::tls_client()).unwrap();
+/// #     builder.set_verify(SslVerifyMode::NONE);
+/// #     let connector = compio_ktls::KtlsConnector::from(Arc::new(builder.build()));
 /// #     let stream = TcpStream::connect(addr).await.unwrap();
-/// #     let connector = TlsConnector::from(Arc::new(client_config));
-/// #     let mut stream = connector.connect("localhost", stream).await.unwrap();
-/// #     stream.shutdown().await.ok();
+/// #     if let Ok(mut s) = connector.connect("localhost", stream).await.unwrap() {
+/// #         s.shutdown().await.ok();
+/// #     }
 /// # })
 /// # .detach();
 /// #
 /// // Accept a connection with kTLS
 /// let (stream, _) = listener.accept().await.unwrap();
-/// let acceptor = KtlsAcceptor::from(config.clone());
+/// let acceptor = KtlsAcceptor::from(ssl_acceptor);
 /// match acceptor.accept(stream).await.unwrap() {
 ///     Ok(mut ktls_stream) => {
 ///         // kTLS enabled successfully
@@ -199,20 +197,9 @@ impl KtlsConnector {
 ///     }
 ///     Err(mut stream) => {
 ///         // kTLS unavailable, fallback to original stream
-///         let acceptor = TlsAcceptor::from(config);
-///         let mut stream = acceptor.accept(stream).await.unwrap();
 ///         stream.shutdown().await.ok();
 ///     }
 /// }
-/// #
-/// # #[derive(Debug)]
-/// # struct NoVerifier;
-/// # impl rustls::client::danger::ServerCertVerifier for NoVerifier {
-/// #     fn verify_server_cert(&self, _: &rustls::pki_types::CertificateDer<'_>, _: &[rustls::pki_types::CertificateDer<'_>], _: &rustls::pki_types::ServerName<'_>, _: &[u8], _: rustls::pki_types::UnixTime) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> { Ok(rustls::client::danger::ServerCertVerified::assertion()) }
-/// #     fn verify_tls12_signature(&self, _: &[u8], _: &rustls::pki_types::CertificateDer<'_>, _: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> { Ok(rustls::client::danger::HandshakeSignatureValid::assertion()) }
-/// #     fn verify_tls13_signature(&self, _: &[u8], _: &rustls::pki_types::CertificateDer<'_>, _: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> { Ok(rustls::client::danger::HandshakeSignatureValid::assertion()) }
-/// #     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> { vec![rustls::SignatureScheme::RSA_PSS_SHA256, rustls::SignatureScheme::RSA_PSS_SHA384, rustls::SignatureScheme::RSA_PSS_SHA512, rustls::SignatureScheme::RSA_PKCS1_SHA256, rustls::SignatureScheme::ECDSA_NISTP256_SHA256, rustls::SignatureScheme::ED25519] }
-/// # }
 /// # })
 /// ```
 #[derive(Clone)]
@@ -261,7 +248,12 @@ impl KtlsAcceptor {
                 }
             }
             #[cfg(feature = "openssl")]
-            KtlsAcceptorInner::OpenSsl { .. } => {}
+            KtlsAcceptorInner::OpenSsl { memmem_mode, .. } => {
+                let mode = memmem_mode.unwrap_or(super::ossl::MemmemMode::Fork);
+                if super::ossl::probe_tls13_secret_offsets(mode).is_err() {
+                    return Ok(Err(stream));
+                }
+            }
             #[cfg(not(any(feature = "rustls", feature = "openssl")))]
             KtlsAcceptorInner::None(_) => return Ok(Err(stream)),
         }

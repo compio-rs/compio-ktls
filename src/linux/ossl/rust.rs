@@ -344,7 +344,7 @@ impl TrafficSecrets {
     }
 }
 
-fn probe_tls13_secret_offsets(mode: MemmemMode) -> io::Result<(usize, usize)> {
+pub(crate) fn probe_tls13_secret_offsets(mode: MemmemMode) -> io::Result<(usize, usize)> {
     // Cached secret offsets
     static TLS13_SECRET_OFFSETS: OnceLock<(usize, usize)> = OnceLock::new();
     if let Some(offsets) = TLS13_SECRET_OFFSETS.get() {
