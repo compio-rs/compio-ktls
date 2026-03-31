@@ -14,7 +14,7 @@ use synchrony::sync;
 #[cfg(not(feature = "sync"))]
 use synchrony::unsync as sync;
 
-use super::{IntoMessage, KeyUpdateRequest, KtlsImplementation, OutgoingState, WriteMessage};
+use super::{IntoMessage, KtlsImplementation, OutgoingState, WriteMessage};
 
 struct KtlsSplitStream<S, C> {
     incoming_stream: Option<sync::bilock::BiLock<S>>,
@@ -125,6 +125,7 @@ where
         Ok(())
     }
 
+    #[cfg(key_update)]
     async fn update_incoming_secret(&mut self) -> io::Result<()> {
         let stream = match &mut self.incoming_stream {
             None => None,
@@ -141,10 +142,12 @@ where
             .lock()
             .await
             .update_rx_secret()?
-            .set(&*stream)?;
+            .set(&*stream)
+            .map_err(super::map_key_update_error)?;
         Ok(())
     }
 
+    #[cfg(key_update)]
     async fn update_outgoing_secret(&mut self, request_peer: bool) -> io::Result<()> {
         let stream = match &mut self.outgoing_stream {
             None => None,
@@ -157,7 +160,7 @@ where
         };
         let mut stream = stream
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "stream is closed"))?;
-        KeyUpdateRequest::new(request_peer)
+        super::super::tls::KeyUpdateRequest::new(request_peer)
             .into_message()
             .write(&mut *stream)
             .await?;
@@ -165,7 +168,8 @@ where
             .lock()
             .await
             .update_tx_secret()?
-            .set(&*stream)?;
+            .set(&*stream)
+            .map_err(super::map_key_update_error)?;
         Ok(())
     }
 }
@@ -357,5 +361,16 @@ where
                 }
             },
         }
+    }
+}
+
+impl<S, C> WriteHalf<S, C>
+where
+    S: AsyncWrite + AsyncWriteAncillary + AsyncReadAncillary + AsFd,
+    C: TlsSession,
+{
+    #[cfg(key_update)]
+    pub(crate) async fn key_update(&mut self, request_peer: bool) -> io::Result<()> {
+        self.inner.update_outgoing_secret(request_peer).await
     }
 }

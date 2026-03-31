@@ -330,4 +330,150 @@ mod ossl_ktls_tests {
             }
         }
     }
+
+    /// Test full kTLS key update: client initiates key update mid-stream
+    #[compio::test]
+    #[cfg(key_update)]
+    async fn test_ossl_full_ktls_key_update() {
+        let server_config = make_server_config();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        compio::runtime::spawn(async move {
+            let acceptor = KtlsAcceptor::from(server_config);
+            let (stream, _) = listener.accept().await.unwrap();
+
+            match acceptor.accept(stream).await.unwrap() {
+                Ok(mut ktls_stream) => {
+                    // Echo loop: read and echo back until EOF
+                    loop {
+                        let buf = vec![0u8; 1024];
+                        let (n, buf) = ktls_stream.read(buf).await.unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        ktls_stream.write_all(buf[..n].to_vec()).await.unwrap();
+                        ktls_stream.flush().await.unwrap();
+                    }
+                    ktls_stream.shutdown().await.ok();
+                }
+                Err(mut stream) => {
+                    stream.shutdown().await.ok();
+                }
+            }
+        })
+        .detach();
+
+        let client_config = make_client_config();
+        let connector = KtlsConnector::from(client_config);
+        let stream = TcpStream::connect(addr).await.unwrap();
+
+        match connector.connect("localhost", stream).await.unwrap() {
+            Ok(mut ktls_stream) => {
+                // Send data before key update
+                let msg1 = b"Before key update";
+                ktls_stream.write_all(msg1.to_vec()).await.unwrap();
+                ktls_stream.flush().await.unwrap();
+
+                let (n, buf) = ktls_stream.read(vec![0u8; 1024]).await.unwrap();
+                assert_eq!(&buf[..n], msg1);
+
+                // Initiate key update
+                ktls_stream.key_update(true).await.unwrap();
+
+                // Send data after key update
+                let msg2 = b"After key update";
+                ktls_stream.write_all(msg2.to_vec()).await.unwrap();
+                ktls_stream.flush().await.unwrap();
+
+                let (n, buf) = ktls_stream.read(vec![0u8; 1024]).await.unwrap();
+                assert_eq!(&buf[..n], msg2);
+
+                ktls_stream.shutdown().await.ok();
+            }
+            Err(stream) => {
+                drop(stream);
+                eprintln!("Warning: kTLS not available on this system");
+            }
+        }
+    }
+
+    /// Test full kTLS key update with split streams: write half initiates key
+    /// update
+    #[compio::test]
+    #[cfg(key_update)]
+    async fn test_ossl_full_ktls_key_update_split() {
+        use compio::io::{AsyncReadExt, util::Splittable};
+
+        let server_config = make_server_config();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        compio::runtime::spawn(async move {
+            let acceptor = KtlsAcceptor::from(server_config);
+            let (stream, _) = listener.accept().await.unwrap();
+
+            match acceptor.accept(stream).await.unwrap() {
+                Ok(ktls_stream) => {
+                    let (mut reader, mut writer) = ktls_stream.split();
+
+                    // Echo loop with split: read in spawned task, write back
+                    let read_task =
+                        compio::runtime::spawn(
+                            async move { reader.read_to_end(vec![]).await.unwrap() },
+                        );
+
+                    let (n, buf) = read_task.await.unwrap();
+                    writer.write_all(buf[..n].to_vec()).await.unwrap();
+                    writer.flush().await.unwrap();
+                    writer.shutdown().await.ok();
+                }
+                Err(mut stream) => {
+                    stream.shutdown().await.ok();
+                }
+            }
+        })
+        .detach();
+
+        let client_config = make_client_config();
+        let connector = KtlsConnector::from(client_config);
+        let stream = TcpStream::connect(addr).await.unwrap();
+
+        match connector.connect("localhost", stream).await.unwrap() {
+            Ok(ktls_stream) => {
+                let (mut reader, mut writer) = ktls_stream.split();
+
+                // Spawn concurrent read
+                let read_task =
+                    compio::runtime::spawn(
+                        async move { reader.read_to_end(vec![]).await.unwrap() },
+                    );
+
+                // Send data before key update
+                let msg1 = b"Before key update split";
+                writer.write_all(msg1.to_vec()).await.unwrap();
+                writer.flush().await.unwrap();
+
+                // Initiate key update via write half
+                writer.key_update(true).await.unwrap();
+
+                // Send data after key update
+                let msg2 = b"After key update split";
+                writer.write_all(msg2.to_vec()).await.unwrap();
+                writer.flush().await.unwrap();
+                writer.shutdown().await.unwrap();
+
+                // Collect read result: should contain both messages
+                let (n, buf) = read_task.await.unwrap();
+                let expected: Vec<u8> = [msg1.as_slice(), msg2.as_slice()].concat();
+                assert_eq!(&buf[..n], &expected[..]);
+            }
+            Err(stream) => {
+                drop(stream);
+                eprintln!("Warning: kTLS not available on this system");
+            }
+        }
+    }
 }

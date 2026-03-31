@@ -346,6 +346,30 @@ impl<S> From<OpenSslConnection<S>> for KtlsStream<S> {
     }
 }
 
+impl<S> KtlsStream<S>
+where
+    S: AsyncWrite + AsyncReadAncillary + AsyncWriteAncillary + AsFd,
+{
+    /// Initiates a TLS 1.3 key update.
+    ///
+    /// This updates the outgoing (TX) traffic secret. If `request_peer` is
+    /// `true`, the peer is also asked to update its outgoing secret so that
+    /// both directions will use fresh keys after the next round-trip.
+    #[cfg(key_update)]
+    pub async fn key_update(&mut self, request_peer: bool) -> io::Result<()> {
+        match &mut self.0 {
+            #[cfg(feature = "rustls")]
+            KtlsStreamInner::RustlsClient(s) => s.key_update(request_peer).await,
+            #[cfg(feature = "rustls")]
+            KtlsStreamInner::RustlsServer(s) => s.key_update(request_peer).await,
+            #[cfg(feature = "openssl")]
+            KtlsStreamInner::OpenSsl(s) => s.key_update(request_peer).await,
+            #[cfg(not(any(feature = "rustls", feature = "openssl")))]
+            KtlsStreamInner::None(f, ..) => match *f {},
+        }
+    }
+}
+
 impl<S> AsyncRead for KtlsStream<S>
 where
     S: AsyncRead + AsyncWrite + AsyncReadAncillary + AsyncWriteAncillary + AsFd,
@@ -524,6 +548,30 @@ where
 }
 
 pub struct KtlsWriteHalf<S>(KtlsWriteHalfInner<S>);
+
+impl<S> KtlsWriteHalf<S>
+where
+    S: AsyncWrite + AsyncReadAncillary + AsyncWriteAncillary + AsFd,
+{
+    /// Initiates a TLS 1.3 key update.
+    ///
+    /// This updates the outgoing (TX) traffic secret. If `request_peer` is
+    /// `true`, the peer is also asked to update its outgoing secret so that
+    /// both directions will use fresh keys after the next round-trip.
+    #[cfg(key_update)]
+    pub async fn key_update(&mut self, request_peer: bool) -> io::Result<()> {
+        match &mut self.0 {
+            #[cfg(feature = "rustls")]
+            KtlsWriteHalfInner::RustlsClient(s) => s.key_update(request_peer).await,
+            #[cfg(feature = "rustls")]
+            KtlsWriteHalfInner::RustlsServer(s) => s.key_update(request_peer).await,
+            #[cfg(feature = "openssl")]
+            KtlsWriteHalfInner::OpenSsl(s) => s.key_update(request_peer).await,
+            #[cfg(not(any(feature = "rustls", feature = "openssl")))]
+            KtlsWriteHalfInner::None(f, ..) => match *f {},
+        }
+    }
+}
 
 #[cfg(feature = "rustls")]
 type RustlsClientWriteHalf<S> =

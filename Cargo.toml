@@ -29,10 +29,12 @@ libc = "0.2"
 ktls-core = "0.0.5"
 
 [features]
-default = ["rustls"]
+default = ["rustls", "detect_key_update_at_build"]
 rustls = ["dep:rustls", "ktls-core/shim-rustls"]
 ring = ["rustls", "rustls/ring"]
 openssl = ["dep:openssl"]
+key_update = []
+detect_key_update_at_build = []
 app-write-with-empty-ancillary = []
 sync = []
 

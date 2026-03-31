@@ -11,7 +11,7 @@
 
 - 基于 [ktls-core](https://github.com/hanyu-dev/ktls) 实现
 - 不锁定特定的 Compio 运行时实现
-- 可插拔的 TLS 实现（目前支持 Rustls）
+- 可插拔的 TLS 实现（目前支持 Rustls 和 OpenSSL）
 - 目前仅支持 TLS 1.3
 - 支持 NewSessionTicket、KeyUpdate 和 Alert 消息处理
 - 支持读写分离（不是那种读写互斥式的），实现真正意义上的并发 I/O
@@ -24,9 +24,13 @@
   `write()`。compio-rs/compio#756 引入了 io-uring 的零拷贝写入，改变了 `write()`
   的默认行为，而这会在启用了 kTLS 的 socket 上出错。因此，使用 io-uring 时，应启用该 feature
   来绕过 zero-copy 写入与 kTLS 的冲突。
+- `key_update`：启用 kTLS 密钥更新支持（需要 Linux 6.13+）。交叉编译目标为 6.13+ 内核时可手动
+  指定此 feature 来强制启用。本机构建通常不需要手动设置——用 `detect_key_update_at_build` 就好。
+- `detect_key_update_at_build`：在编译时探测宿主机的内核版本。如果内核 >= 6.13，则自动启用密钥
+  更新支持；反之即使 `key_update` feature 已开启也会被覆盖关闭。推荐在本机构建和 CI 中使用。
 - `sync`：单线程无须开启，多线程才需要。仅对读写分离有用。
 
-（所以基本上就是，除非你自己指定 `compio/polling`，不然所有 feature 都得启用就对了，除了 `sync`）
+（所以基本上就是，除非你自己指定 `compio/polling`，不然所有 feature 都启用就对了，除了 `sync`）
 
 ## 使用方法
 

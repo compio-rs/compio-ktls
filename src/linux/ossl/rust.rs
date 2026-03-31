@@ -2,8 +2,9 @@
 // Copyright 2026 Fantix King
 
 use std::{
+    borrow::Cow,
     cell::RefCell,
-    io,
+    io::{self, Read},
     os::fd::AsFd,
     rc::Rc,
     slice,
@@ -11,25 +12,20 @@ use std::{
 };
 
 use compio_io::{AsyncRead, AsyncWrite, ancillary::AsyncWriteAncillary};
-use ktls_core::{
-    ConnectionTrafficSecrets, Peer, ProtocolVersion, TlsCryptoInfoRx, TlsCryptoInfoTx,
-};
+use ktls_core::{ContentType, Peer, ProtocolVersion, TlsCryptoInfoRx, TlsCryptoInfoTx};
 use openssl::{
-    asn1::Asn1Time,
-    bn::BigNum,
-    hash::MessageDigest,
     md::{Md, MdRef},
     nid::Nid,
     pkey::{Id, PKey},
-    pkey_ctx::{HkdfMode, PkeyCtx},
     ssl::{
         HandshakeError, Ssl, SslAcceptor, SslCipherRef, SslConnector, SslContextBuilder, SslMethod,
         SslRef, SslStream, SslVerifyMode, SslVersion,
     },
-    x509::X509Builder,
+    symm,
 };
 
 use super::{
+    super::tls::HandshakeMessage,
     CipherKind, KtlsDuplexStream, KtlsStream, RecordStream, Secrets, TrafficSecrets,
     prober::{MemmemMode, Tls13SecretOffsetProber},
 };
@@ -41,6 +37,7 @@ pub(crate) struct KtlsSession<S> {
     md: &'static MdRef,
     outgoing_secret_offset: usize,
     incoming_secret_offset: usize,
+    rx_seq: u64,
 }
 
 impl<S> KtlsSession<S> {
@@ -67,7 +64,7 @@ impl<S> KtlsSession<S> {
         let cipher_kind = ssl_cipher.try_into()?;
 
         // Cache the secret offsets under tx/rx tags
-        let (client_secret_offset, server_secret_offset) = probe_tls1_3_secret_offsets(mode)?;
+        let (client_secret_offset, server_secret_offset) = probe_tls13_secret_offsets(mode)?;
         let (outgoing_secret_offset, incoming_secret_offset) = match ssl.is_server() {
             true => (server_secret_offset, client_secret_offset),
             false => (client_secret_offset, server_secret_offset),
@@ -80,41 +77,82 @@ impl<S> KtlsSession<S> {
             md,
             incoming_secret_offset,
             outgoing_secret_offset,
+            rx_seq: 0,
         })
     }
 
-    fn extract_tls13_secrets(&self) -> io::Result<Secrets> {
-        let ssl = self.ssl_stream.ssl();
-        let ptr = ssl as *const _ as *const u8;
-        let md_size = self.md.size();
-        // SAFETY: the SSL struct layout is stable in the same process, so the secret
-        // offsets found previously should be valid up to the secret lengths
-        let incoming_secret =
-            unsafe { slice::from_raw_parts(ptr.add(self.incoming_secret_offset), md_size) };
-        let outgoing_secret =
-            unsafe { slice::from_raw_parts(ptr.add(self.outgoing_secret_offset), md_size) };
+    fn incoming_secret(&self) -> &[u8] {
+        let ptr = self.ssl_stream.ssl() as *const _ as *const u8;
+        // SAFETY: the SSL struct layout is stable in the same process
+        unsafe { slice::from_raw_parts(ptr.add(self.incoming_secret_offset), self.md.size()) }
+    }
 
+    fn outgoing_secret(&self) -> &[u8] {
+        let ptr = self.ssl_stream.ssl() as *const _ as *const u8;
+        // SAFETY: the SSL struct layout is stable in the same process
+        unsafe { slice::from_raw_parts(ptr.add(self.outgoing_secret_offset), self.md.size()) }
+    }
+
+    fn extract_tls13_secrets(&self) -> io::Result<Secrets> {
         let mut rv = Secrets::new(self.cipher_kind);
         rv.outgoing_secrets
-            .tls1_3_derive_key_and_iv(self.md, outgoing_secret)?;
+            .tls1_3_derive_key_and_iv(self.md, self.outgoing_secret())?;
         rv.incoming_secrets
-            .tls1_3_derive_key_and_iv(self.md, incoming_secret)?;
-        if ssl.is_server() {
-            rv.tx_seq = ssl.num_tickets() as _;
+            .tls1_3_derive_key_and_iv(self.md, self.incoming_secret())?;
+        if self.ssl_stream.ssl().is_server() {
+            // This hack depends on OpenSSL implementation detail: each NewSessionTicket
+            // message is always encrypted in one TLS record
+            rv.tx_seq = self.ssl_stream.ssl().num_tickets() as _;
         }
         Ok(rv)
     }
 
     fn take_inner(&mut self) -> io::Result<S> {
-        let (stream, ..) = self.ssl_stream.get_mut().take()?;
-        Ok(stream)
+        self.ssl_stream.get_mut().take_stream()
     }
 
-    fn derive_updated_secret(&self, secret: &mut [u8]) -> io::Result<()> {
-        let mut current = secret.to_vec();
-        tls13_hkdf_expand(self.md, &current, b"traffic upd", secret)?;
-        current.fill(0);
-        std::hint::black_box(current);
+    fn feed_message(&mut self, msg: HandshakeMessage) -> io::Result<()> {
+        // Re-derive incoming traffic secrets to avoid caching them
+        let mut traffic_secrets = TrafficSecrets::new(self.cipher_kind);
+        traffic_secrets.tls1_3_derive_key_and_iv(self.md, self.incoming_secret())?;
+
+        // Re-encrypt the plaintext message and feed it back to OpenSSL
+        let msg = msg.into_tls13_inner_plaintext()?;
+        for trunk in traffic_secrets.encrypt_tls13_record(&msg, self.rx_seq)? {
+            self.ssl_stream.get_mut().feed(&trunk)?;
+        }
+        self.rx_seq += 1;
+
+        // Drive the OpenSSL state machine
+        let mut tmp = [0u8; 1];
+        match self.ssl_stream.read(&mut tmp) {
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            Err(e) => Err(e),
+            Ok(_) => Err(io::Error::other(
+                "unexpectedly read data after feeding control message",
+            )),
+        }
+    }
+
+    #[cfg(key_update)]
+    fn key_update(&mut self) -> io::Result<()> {
+        use std::io::Write;
+
+        use libc::{c_int, c_void};
+        use openssl::error::ErrorStack;
+
+        const SSL_KEY_UPDATE_NOT_REQUESTED: c_int = 0;
+
+        unsafe extern "C" {
+            fn SSL_key_update(ssl: *mut c_void, updatetype: c_int) -> c_int;
+        }
+
+        let ssl = self.ssl_stream.ssl() as *const _;
+        if unsafe { SSL_key_update(ssl as *mut _, SSL_KEY_UPDATE_NOT_REQUESTED) } == 0 {
+            return Err(ErrorStack::get().into());
+        }
+        let _ = self.ssl_stream.write(&[0; 1])?;
+        self.ssl_stream.get_mut().take_write_buf()?;
         Ok(())
     }
 }
@@ -131,50 +169,45 @@ impl<S> ktls_core::TlsSession for KtlsSession<S> {
         self.protocol_version
     }
 
+    #[cfg(key_update)]
     fn update_tx_secret(&mut self) -> ktls_core::error::Result<TlsCryptoInfoTx> {
-        // Derive a new outgoing secret in the SSL object
-        let ssl = self.ssl_stream.ssl() as *const _ as *mut u8;
-        // SAFETY: the SSL struct layout is stable in the same process, so the secret
-        // offsets found previously should be valid up to the secret length
-        let secret = unsafe {
-            slice::from_raw_parts_mut(ssl.add(self.outgoing_secret_offset), self.md.size())
-        };
-        self.derive_updated_secret(secret)
+        self.key_update()
             .map_err(ktls_core::Error::KeyUpdateFailed)?;
-
-        // Derive new application traffic secrets
-        let mut traffic_secrets = TrafficSecrets::new(self.cipher_kind);
-        traffic_secrets
-            .tls1_3_derive_key_and_iv(self.md, secret)
-            .map_err(ktls_core::Error::KeyUpdateFailed)?;
-        let secrets = ConnectionTrafficSecrets::try_from(&traffic_secrets)
+        let secrets = TrafficSecrets::new(self.cipher_kind)
+            .tls1_3_derive_key_and_iv(self.md, self.outgoing_secret())
+            .map_err(ktls_core::Error::KeyUpdateFailed)?
+            .try_into()
             .map_err(|e| ktls_core::Error::Tls(Box::new(e)))?;
         TlsCryptoInfoTx::new(self.protocol_version, secrets, 0)
     }
 
-    fn update_rx_secret(&mut self) -> ktls_core::error::Result<TlsCryptoInfoRx> {
-        // Derive a new incoming secret in the SSL object
-        let ssl = self.ssl_stream.ssl() as *const _ as *mut u8;
-        // SAFETY: the SSL struct layout is stable in the same process, so the secret
-        // offsets found previously should be valid up to the secret length
-        let secret = unsafe {
-            slice::from_raw_parts_mut(ssl.add(self.incoming_secret_offset), self.md.size())
-        };
-        self.derive_updated_secret(secret)
-            .map_err(ktls_core::Error::KeyUpdateFailed)?;
+    #[cfg(not(key_update))]
+    fn update_tx_secret(&mut self) -> ktls_core::error::Result<TlsCryptoInfoTx> {
+        unreachable!("should not be called without key_update flag")
+    }
 
-        // Derive new application traffic secrets
-        let mut traffic_secrets = TrafficSecrets::new(self.cipher_kind);
-        traffic_secrets
-            .tls1_3_derive_key_and_iv(self.md, secret)
+    #[cfg(key_update)]
+    fn update_rx_secret(&mut self) -> ktls_core::error::Result<TlsCryptoInfoRx> {
+        use super::super::tls::{IntoMessage, KeyUpdateRequest};
+        self.feed_message(KeyUpdateRequest::new(false).into_message())
             .map_err(ktls_core::Error::KeyUpdateFailed)?;
-        let secrets = ConnectionTrafficSecrets::try_from(&traffic_secrets)
+        self.rx_seq = 0;
+        let secrets = TrafficSecrets::new(self.cipher_kind)
+            .tls1_3_derive_key_and_iv(self.md, self.incoming_secret())
+            .map_err(ktls_core::Error::KeyUpdateFailed)?
+            .try_into()
             .map_err(|e| ktls_core::Error::Tls(Box::new(e)))?;
         TlsCryptoInfoRx::new(self.protocol_version, secrets, 0)
     }
 
-    fn handle_new_session_ticket(&mut self, _payload: &[u8]) -> ktls_core::error::Result<()> {
-        Ok(())
+    #[cfg(not(key_update))]
+    fn update_rx_secret(&mut self) -> ktls_core::error::Result<TlsCryptoInfoRx> {
+        unreachable!("should not be called without key_update flag")
+    }
+
+    fn handle_new_session_ticket(&mut self, payload: &[u8]) -> ktls_core::error::Result<()> {
+        self.feed_message(HandshakeMessage::NewSessionTicket(Cow::Borrowed(payload)))
+            .map_err(ktls_core::Error::HandleNewSessionTicketFailed)
     }
 }
 
@@ -245,8 +278,19 @@ impl TryFrom<&SslCipherRef> for CipherKind {
     }
 }
 
+impl From<CipherKind> for symm::Cipher {
+    fn from(cipher: CipherKind) -> symm::Cipher {
+        match cipher {
+            CipherKind::Aes128Gcm => Self::aes_128_gcm(),
+            CipherKind::Aes256Gcm => Self::aes_256_gcm(),
+            CipherKind::Aes128Ccm => Self::aes_128_ccm(),
+            CipherKind::ChaCha20Poly1305 => Self::chacha20_poly1305(),
+        }
+    }
+}
+
 impl TrafficSecrets {
-    fn tls1_3_derive_key_and_iv(&mut self, md: &MdRef, secret: &[u8]) -> io::Result<()> {
+    fn tls1_3_derive_key_and_iv(&mut self, md: &MdRef, secret: &[u8]) -> io::Result<&Self> {
         let key_size = self.cipher_kind.key_size();
         let salt_size = self.cipher_kind.salt_size();
         let iv_size = self.cipher_kind.iv_size();
@@ -256,15 +300,55 @@ impl TrafficSecrets {
 
         let out = &mut self.buf[key_size..key_size + salt_size + iv_size];
         tls13_hkdf_expand(md, secret, b"iv", out)?;
-        Ok(())
+        Ok(self)
+    }
+
+    fn encrypt_tls13_record(&self, inner_plaintext: &[u8], seq: u64) -> io::Result<[Vec<u8>; 3]> {
+        // Construct nonce = (salt || iv) XOR padded_seq
+        let salt = self.salt();
+        let iv = self.iv();
+        let nonce_len = salt.len() + iv.len();
+        let mut nonce = Vec::with_capacity(nonce_len);
+        nonce.extend_from_slice(salt);
+        nonce.extend_from_slice(iv);
+        let seq_be = seq.to_be_bytes();
+        let seq_be_len = seq_be.len();
+        assert!(nonce_len >= seq_be_len);
+        seq_be
+            .into_iter()
+            .zip(nonce.iter_mut().skip(nonce_len - seq_be_len))
+            .for_each(|(s, n)| *n ^= s);
+
+        // AAD = TLS record header
+        const TAG_LEN: usize = 16;
+        let encrypted_len: u16 = (inner_plaintext.len() + TAG_LEN)
+            .try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many bytes"))?;
+        let mut aad = Vec::new();
+        aad.push(ContentType::ApplicationData.into());
+        aad.extend_from_slice(&u16::from(ProtocolVersion::TLSv1_2).to_be_bytes());
+        aad.extend_from_slice(&encrypted_len.to_be_bytes());
+
+        // AEAD-encrypt
+        let mut tag = vec![0u8; TAG_LEN];
+        let ciphertext = symm::encrypt_aead(
+            self.cipher_kind.into(),
+            self.key(),
+            Some(&nonce),
+            &aad,
+            inner_plaintext,
+            &mut tag,
+        )?;
+
+        Ok([aad, ciphertext, tag])
     }
 }
 
-fn probe_tls1_3_secret_offsets(mode: MemmemMode) -> io::Result<(usize, usize)> {
+fn probe_tls13_secret_offsets(mode: MemmemMode) -> io::Result<(usize, usize)> {
     // Cached secret offsets
-    static TLS1_3_SECRET_OFFSETS: OnceLock<(usize, usize)> = OnceLock::new();
-    if let Some((client_secret_offset, server_secret_offset)) = TLS1_3_SECRET_OFFSETS.get() {
-        return Ok((*client_secret_offset, *server_secret_offset));
+    static TLS13_SECRET_OFFSETS: OnceLock<(usize, usize)> = OnceLock::new();
+    if let Some(offsets) = TLS13_SECRET_OFFSETS.get() {
+        return Ok(*offsets);
     }
 
     // Prepare the keylog callback
@@ -282,6 +366,7 @@ fn probe_tls1_3_secret_offsets(mode: MemmemMode) -> io::Result<(usize, usize)> {
     let pkey = PKey::private_key_from_pem(pem.as_ref())?;
 
     // Construct a short-lived self-signed certificate
+    use openssl::{asn1::Asn1Time, bn::BigNum, hash::MessageDigest, x509::X509Builder};
     let mut builder = X509Builder::new()?;
     let serial = BigNum::from_u32(1)?.to_asn1_integer()?;
     builder.set_serial_number(&serial)?;
@@ -358,7 +443,7 @@ fn probe_tls1_3_secret_offsets(mode: MemmemMode) -> io::Result<(usize, usize)> {
         }
     }
 
-    Ok(*TLS1_3_SECRET_OFFSETS.get_or_init(|| (client_offset, server_offset)))
+    Ok(*TLS13_SECRET_OFFSETS.get_or_init(|| (client_offset, server_offset)))
 }
 
 fn tls13_hkdf_expand(md: &MdRef, secret: &[u8], label: &[u8], out: &mut [u8]) -> io::Result<()> {
@@ -378,6 +463,7 @@ fn tls13_hkdf_expand(md: &MdRef, secret: &[u8], label: &[u8], out: &mut [u8]) ->
     hkdf_info.extend_from_slice(label);
     hkdf_info.push(0); // no data
 
+    use openssl::pkey_ctx::{HkdfMode, PkeyCtx};
     let mut ctx = PkeyCtx::new_id(Id::HKDF)?;
     ctx.derive_init()?;
     ctx.set_hkdf_mode(HkdfMode::EXPAND_ONLY)?;

@@ -17,7 +17,8 @@ mod prober;
 mod rust;
 
 const MAX_WRITE_BUF_SIZE: usize = 64 * 1024 * 1024;
-const UPGRADED_OR_IO_ERROR: &str = "stream was upgraded or I/O in progress";
+const IO_IN_PROGRESS: &str = "I/O in progress";
+const STREAM_UPGRADED: &str = "stream was upgraded";
 
 #[derive(Copy, Clone, Debug)]
 pub enum CipherKind {
@@ -56,7 +57,7 @@ impl CipherKind {
     }
 
     const fn max_size() -> usize {
-        const KINDS: [CipherKind; 4] = [
+        let all_kinds = [
             CipherKind::Aes128Gcm,
             CipherKind::Aes256Gcm,
             CipherKind::Aes128Ccm,
@@ -64,8 +65,8 @@ impl CipherKind {
         ];
         let mut max = 0;
         let mut i = 0;
-        while i < KINDS.len() {
-            let kind = KINDS[i];
+        while i < all_kinds.len() {
+            let kind = all_kinds[i];
             let size = kind.key_size() + kind.iv_size() + kind.salt_size();
             if size > max {
                 max = size;
@@ -81,7 +82,7 @@ impl CipherKind {
 struct RecordStream<S>(Option<RecordStreamInner<S>>);
 
 struct RecordStreamInner<S> {
-    stream: S,
+    stream: Option<S>,
     read_buf: Slice<Vec<u8>>,
     write_buf: Vec<u8>,
 }
@@ -89,7 +90,7 @@ struct RecordStreamInner<S> {
 impl<S> RecordStream<S> {
     fn new(inner: S) -> Self {
         Self(Some(RecordStreamInner {
-            stream: inner,
+            stream: Some(inner),
             read_buf: Vec::new().slice(..),
             write_buf: Vec::new(),
         }))
@@ -98,27 +99,62 @@ impl<S> RecordStream<S> {
     fn borrow_mut(&mut self) -> io::Result<&mut RecordStreamInner<S>> {
         self.0
             .as_mut()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::ResourceBusy, UPGRADED_OR_IO_ERROR))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::ResourceBusy, IO_IN_PROGRESS))
     }
 
-    fn take(&mut self) -> io::Result<(S, Slice<Vec<u8>>, Vec<u8>)> {
+    fn take(&mut self) -> io::Result<RecordStreamInner<S>> {
+        self.0
+            .take()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::ResourceBusy, IO_IN_PROGRESS))
+    }
+
+    fn take_all(&mut self) -> io::Result<(S, Slice<Vec<u8>>, Vec<u8>)> {
         let RecordStreamInner {
             stream,
             read_buf,
             write_buf,
-        } = self
-            .0
-            .take()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::ResourceBusy, UPGRADED_OR_IO_ERROR))?;
-        Ok((stream, read_buf, write_buf))
+        } = self.take()?;
+        match stream {
+            Some(stream) => Ok((stream, read_buf, write_buf)),
+            None => {
+                self.put(None, read_buf, write_buf);
+                Err(io::Error::new(io::ErrorKind::NotConnected, STREAM_UPGRADED))
+            }
+        }
     }
 
-    fn put(&mut self, stream: S, read_buf: Slice<Vec<u8>>, write_buf: Vec<u8>) {
+    fn put(&mut self, stream: Option<S>, read_buf: Slice<Vec<u8>>, write_buf: Vec<u8>) {
         self.0 = Some(RecordStreamInner {
             stream,
             read_buf,
             write_buf,
         });
+    }
+
+    fn take_stream(&mut self) -> io::Result<S> {
+        self.borrow_mut()?
+            .stream
+            .take()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, STREAM_UPGRADED))
+    }
+
+    fn feed(&mut self, data: &[u8]) -> io::Result<()> {
+        self.borrow_mut()?
+            .read_buf
+            .as_inner_mut()
+            .extend_from_slice(data);
+        Ok(())
+    }
+
+    #[allow(unused)]
+    fn take_write_buf(&mut self) -> io::Result<Vec<u8>> {
+        let RecordStreamInner {
+            stream,
+            read_buf,
+            write_buf,
+        } = self.take()?;
+        self.put(stream, read_buf, Vec::new());
+        Ok(write_buf)
     }
 
     fn has_pending_write(&self) -> bool {
@@ -131,26 +167,30 @@ impl<S> RecordStream<S> {
 
 impl<S: AsyncRead> RecordStream<S> {
     async fn fill_read_buf(&mut self) -> io::Result<()> {
-        let (mut stream, read_buf, write_buf) = self.take()?;
+        let (mut stream, read_buf, write_buf) = self.take_all()?;
         let read_buf = super::read_record(&mut stream, read_buf).await?;
-        self.put(stream, read_buf, write_buf);
+        self.put(Some(stream), read_buf, write_buf);
         Ok(())
     }
 }
 
 impl<S: AsyncWrite> RecordStream<S> {
     async fn flush_write_buf(&mut self) -> io::Result<()> {
-        let (mut stream, read_buf, write_buf) = self.take()?;
+        let (mut stream, read_buf, write_buf) = self.take_all()?;
         let ((), mut write_buf) = buf_try!(@try stream.write_all(write_buf).await);
         write_buf.clear();
-        self.put(stream, read_buf, write_buf);
+        self.put(Some(stream), read_buf, write_buf);
         Ok(())
     }
 }
 
 impl<S> Read for RecordStream<S> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let (stream, mut read_buf, write_buf) = self.take()?;
+        let RecordStreamInner {
+            stream,
+            mut read_buf,
+            write_buf,
+        } = self.take()?;
         let rv = if read_buf.is_empty() {
             Err(io::ErrorKind::WouldBlock.into())
         } else {

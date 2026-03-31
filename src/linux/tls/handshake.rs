@@ -7,12 +7,13 @@ use compio_buf::{BufResult, IoBuf, IoBufMut, buf_try};
 use compio_io::ancillary::{AsyncReadAncillary, AsyncWriteAncillary};
 use ktls_core::ContentType;
 
-use super::{AsyncWriteAncillaryExt, IntoMessage, Message, ReadMessage, WriteMessage};
+use super::{AsyncWriteAncillaryExt, Message, ReadMessage, WriteMessage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 enum HandshakeType {
     NewSessionTicket = 4,
+    #[cfg(key_update)]
     KeyUpdate        = 24,
 }
 
@@ -23,10 +24,11 @@ impl TryFrom<u8> for HandshakeType {
         use HandshakeType::*;
         match value {
             v if v == NewSessionTicket as u8 => Ok(NewSessionTicket),
+            #[cfg(key_update)]
             v if v == KeyUpdate as u8 => Ok(KeyUpdate),
             v => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Unknown handshake type: {v:x}"),
+                io::ErrorKind::Unsupported,
+                format!("Unsupported handshake type: {v:x}"),
             )),
         }
     }
@@ -36,6 +38,7 @@ impl HandshakeType {
     const fn allowed_length_range(&self) -> RangeInclusive<u32> {
         match self {
             Self::NewSessionTicket => 14..=4096,
+            #[cfg(key_update)]
             Self::KeyUpdate => 1..=1,
         }
     }
@@ -102,6 +105,7 @@ impl HandshakeHeader {
 
 pub(crate) enum HandshakeMessage<'a> {
     NewSessionTicket(Cow<'a, [u8]>),
+    #[cfg(key_update)]
     KeyUpdate(KeyUpdateRequest),
 }
 
@@ -125,6 +129,7 @@ impl<'a> ReadMessage for HandshakeMessage<'a> {
         let payload = unsafe { hdr.detach_payload(&buf) };
         let res = match hdr.ty {
             HandshakeType::NewSessionTicket => Ok(Self::NewSessionTicket(payload)),
+            #[cfg(key_update)]
             HandshakeType::KeyUpdate => KeyUpdateRequest::decode(&payload).map(Self::KeyUpdate),
         };
         BufResult(res, buf).map_res(|msg| (msg_len, msg))
@@ -137,33 +142,7 @@ impl<'a> WriteMessage for HandshakeMessage<'a> {
         S: AsyncWriteAncillary,
         B: IoBuf,
     {
-        match self {
-            Self::NewSessionTicket(ticket) => {
-                Self::write_impl(stream, HandshakeType::NewSessionTicket, ticket, control).await
-            }
-            Self::KeyUpdate(req) => {
-                let payload = req.encode().to_vec().into();
-                Self::write_impl(stream, HandshakeType::KeyUpdate, payload, control).await
-            }
-        }
-    }
-}
-
-impl<'a> HandshakeMessage<'a> {
-    async fn write_impl<S: AsyncWriteAncillary, B: IoBuf>(
-        stream: &mut S,
-        ty: HandshakeType,
-        payload: Cow<'_, [u8]>,
-        control: B,
-    ) -> io::Result<()> {
-        let payload_length = payload.len().try_into().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Payload too large for handshake message",
-            )
-        })?;
-        let hdr = HandshakeHeader { ty, payload_length };
-        let mut buf = hdr.encode().to_vec();
+        let (mut buf, payload) = self.encode()?;
         match payload {
             Cow::Borrowed(payload) => {
                 buf.extend_from_slice(payload);
@@ -180,6 +159,35 @@ impl<'a> HandshakeMessage<'a> {
     }
 }
 
+impl<'a> HandshakeMessage<'a> {
+    fn encode(self) -> io::Result<(Vec<u8>, Cow<'a, [u8]>)> {
+        let (ty, payload) = match self {
+            Self::NewSessionTicket(payload) => (HandshakeType::NewSessionTicket, payload),
+            #[cfg(key_update)]
+            Self::KeyUpdate(req) => (HandshakeType::KeyUpdate, req.encode().to_vec().into()),
+        };
+        let payload_length = payload.len().try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Payload too large for handshake message",
+            )
+        })?;
+        let hdr = HandshakeHeader { ty, payload_length };
+        let buf = hdr.encode().to_vec();
+        Ok((buf, payload))
+    }
+
+    pub(crate) fn into_tls13_inner_plaintext(self) -> io::Result<Vec<u8>> {
+        // TLS 1.3 inner plaintext: TLSPlaintext (header + payload) | ContentType
+        let (header, payload) = self.encode()?;
+        let mut res = header;
+        res.reserve(payload.len() + 1);
+        res.extend_from_slice(&payload);
+        res.push(Self::CONTENT_TYPE.into());
+        Ok(res)
+    }
+}
+
 impl fmt::Debug for HandshakeMessage<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -187,6 +195,7 @@ impl fmt::Debug for HandshakeMessage<'_> {
                 .debug_tuple("HandshakeMessage::NewSessionTicket")
                 .field(&format_args!("{} bytes", ticket.len()))
                 .finish(),
+            #[cfg(key_update)]
             Self::KeyUpdate(req) => f
                 .debug_tuple("HandshakeMessage::KeyUpdate")
                 .field(req)
@@ -197,14 +206,17 @@ impl fmt::Debug for HandshakeMessage<'_> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[cfg(key_update)]
 enum KeyUpdateRequestInner {
     UpdateNotRequested = 0,
     UpdateRequested    = 1,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(key_update)]
 pub(crate) struct KeyUpdateRequest(KeyUpdateRequestInner);
 
+#[cfg(key_update)]
 impl KeyUpdateRequest {
     const SIZE: usize = 1;
 
@@ -217,6 +229,7 @@ impl KeyUpdateRequest {
         }
     }
 
+    #[cfg(key_update)]
     pub(crate) fn requested(&self) -> bool {
         matches!(self.0, KeyUpdateRequestInner::UpdateRequested)
     }
@@ -242,7 +255,8 @@ impl KeyUpdateRequest {
     }
 }
 
-impl IntoMessage for KeyUpdateRequest {
+#[cfg(key_update)]
+impl super::IntoMessage for KeyUpdateRequest {
     type Message = HandshakeMessage<'static>;
 
     fn into_message(self) -> Self::Message {
@@ -260,6 +274,7 @@ mod tests {
             HandshakeType::try_from(4).unwrap(),
             HandshakeType::NewSessionTicket
         );
+        #[cfg(key_update)]
         assert_eq!(
             HandshakeType::try_from(24).unwrap(),
             HandshakeType::KeyUpdate
@@ -280,11 +295,14 @@ mod tests {
                 .contains(&5000)
         );
 
+        #[cfg(key_update)]
         assert!(HandshakeType::KeyUpdate.allowed_length_range().contains(&1));
+        #[cfg(key_update)]
         assert!(!HandshakeType::KeyUpdate.allowed_length_range().contains(&2));
     }
 
     #[test]
+    #[cfg(key_update)]
     fn test_handshake_header_encode_decode() {
         let header = HandshakeHeader {
             ty: HandshakeType::KeyUpdate,
@@ -300,6 +318,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(key_update)]
     fn test_handshake_header_invalid_length() {
         let mut buf = [0u8; 4];
         buf[0] = 24; // KeyUpdate type
@@ -310,6 +329,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(key_update)]
     fn test_key_update_request_new() {
         let req = KeyUpdateRequest::new(false);
         assert!(!req.requested());
@@ -321,6 +341,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(key_update)]
     fn test_key_update_request_encode_decode() {
         let req = KeyUpdateRequest::new(false);
         let encoded = req.encode();
@@ -336,6 +357,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(key_update)]
     fn test_key_update_request_decode_invalid() {
         assert!(KeyUpdateRequest::decode(&[2]).is_err());
         assert!(KeyUpdateRequest::decode(&[0, 1]).is_err());

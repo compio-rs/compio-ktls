@@ -11,7 +11,7 @@ Kernel TLS (kTLS) support for [Compio](https://github.com/compio-rs/compio).
 
 - Built on top of [ktls-core](https://github.com/hanyu-dev/ktls)
 - Not tied to any specific Compio runtime implementation
-- Pluggable TLS implementations (currently supports Rustls)
+- Pluggable TLS implementations (currently supports Rustls and OpenSSL)
 - Currently supports TLS 1.3 only
 - Supports NewSessionTicket, KeyUpdate, and Alert message handling
 - Supports splitting `KtlsStream` into read/write halves for concurrent I/O
@@ -25,6 +25,13 @@ Kernel TLS (kTLS) support for [Compio](https://github.com/compio-rs/compio).
   which changed the default behavior of `write()` in a way that breaks on kTLS-enabled
   sockets. Enable this feature when using io-uring to work around the conflict between
   zero-copy writes and kTLS.
+- `key_update`: Enable kTLS key update support (requires Linux 6.13+). Use this to
+  force-enable key update when cross-compiling for a 6.13+ target. On native builds you
+  typically don't need to set this manually — use `detect_key_update_at_build` instead.
+- `detect_key_update_at_build`: Probe the build-host kernel version at compile time. If the
+  running kernel is >= 6.13, key update support is enabled automatically; otherwise it is
+  disabled even if the `key_update` feature is on. This is the recommended mode for native
+  builds and CI.
 - `sync`: Use thread-safe locks for the split read/write halves. By default, single-threaded
   (unsync) locks are used. Enable this feature if you need to use the split halves across
   threads.

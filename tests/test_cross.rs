@@ -142,6 +142,128 @@ mod ossl_rustls_cross_tests {
         stream.shutdown().await.ok();
     }
 
+    /// Test OpenSSL kTLS client key update against a rustls TLS echo server
+    #[compio::test]
+    #[cfg(key_update)]
+    async fn test_ossl_ktls_client_key_update_to_rustls_server() {
+        let server_config = make_rustls_server_config();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        compio::runtime::spawn(async move {
+            let acceptor = compio::tls::TlsAcceptor::from(server_config);
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = acceptor.accept(stream).await.unwrap();
+
+            // Echo loop
+            loop {
+                let buf = vec![0u8; 1024];
+                let (n, buf) = stream.read(buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                stream.write_all(buf[..n].to_vec()).await.unwrap();
+                stream.flush().await.unwrap();
+            }
+            stream.shutdown().await.ok();
+        })
+        .detach();
+
+        let client_config = make_ossl_client_config();
+        let connector = KtlsConnector::from(client_config);
+        let stream = TcpStream::connect(addr).await.unwrap();
+
+        match connector.connect("localhost", stream).await.unwrap() {
+            Ok(mut ktls_stream) => {
+                let msg1 = b"Before key update cross";
+                ktls_stream.write_all(msg1.to_vec()).await.unwrap();
+                ktls_stream.flush().await.unwrap();
+
+                let (n, buf) = ktls_stream.read(vec![0u8; 1024]).await.unwrap();
+                assert_eq!(&buf[..n], msg1);
+
+                // Initiate key update
+                ktls_stream.key_update(true).await.unwrap();
+
+                let msg2 = b"After key update cross";
+                ktls_stream.write_all(msg2.to_vec()).await.unwrap();
+                ktls_stream.flush().await.unwrap();
+
+                let (n, buf) = ktls_stream.read(vec![0u8; 1024]).await.unwrap();
+                assert_eq!(&buf[..n], msg2);
+
+                ktls_stream.shutdown().await.ok();
+            }
+            Err(stream) => {
+                drop(stream);
+                eprintln!("Warning: kTLS not available on this system");
+            }
+        }
+    }
+
+    /// Test OpenSSL kTLS server key update when a rustls TLS client connects
+    #[compio::test]
+    #[cfg(key_update)]
+    async fn test_ossl_ktls_server_key_update_from_rustls_client() {
+        let server_config = make_ossl_server_config();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        compio::runtime::spawn(async move {
+            let acceptor = KtlsAcceptor::from(server_config);
+            let (stream, _) = listener.accept().await.unwrap();
+
+            match acceptor.accept(stream).await.unwrap() {
+                Ok(mut ktls_stream) => {
+                    // Read first message, echo it back
+                    let buf = vec![0u8; 1024];
+                    let (n, buf) = ktls_stream.read(buf).await.unwrap();
+                    ktls_stream.write_all(buf[..n].to_vec()).await.unwrap();
+                    ktls_stream.flush().await.unwrap();
+
+                    // Server initiates key update
+                    ktls_stream.key_update(true).await.unwrap();
+
+                    // Read second message, echo it back
+                    let buf = vec![0u8; 1024];
+                    let (n, buf) = ktls_stream.read(buf).await.unwrap();
+                    ktls_stream.write_all(buf[..n].to_vec()).await.unwrap();
+                    ktls_stream.flush().await.unwrap();
+
+                    ktls_stream.shutdown().await.ok();
+                }
+                Err(mut stream) => {
+                    stream.shutdown().await.ok();
+                }
+            }
+        })
+        .detach();
+
+        let client_config = make_rustls_client_config();
+        let connector = TlsConnector::from(client_config);
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut stream = connector.connect("localhost", stream).await.unwrap();
+
+        let msg1 = b"Before server key update";
+        stream.write_all(msg1.to_vec()).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let (n, buf) = stream.read(vec![0u8; 1024]).await.unwrap();
+        assert_eq!(&buf[..n], msg1);
+
+        // Server does key update in between; client (rustls) handles it transparently
+        let msg2 = b"After server key update";
+        stream.write_all(msg2.to_vec()).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let (n, buf) = stream.read(vec![0u8; 1024]).await.unwrap();
+        assert_eq!(&buf[..n], msg2);
+
+        stream.shutdown().await.ok();
+    }
+
     #[derive(Debug)]
     struct NoVerifier;
 

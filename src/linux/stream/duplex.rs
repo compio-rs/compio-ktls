@@ -11,7 +11,7 @@ use compio_io::{
 use ktls_core::{AlertDescription, TlsSession};
 
 use super::{
-    IntoMessage, KeyUpdateRequest, KtlsImplementation, OutgoingState, WriteMessage,
+    IntoMessage, KtlsImplementation, OutgoingState, WriteMessage,
     split::{self, ReadHalf, WriteHalf},
 };
 
@@ -71,17 +71,25 @@ where
         Ok(())
     }
 
+    #[cfg(key_update)]
     async fn update_incoming_secret(&mut self) -> io::Result<()> {
-        self.session.update_rx_secret()?.set(self.stream()?)?;
+        self.session
+            .update_rx_secret()?
+            .set(self.stream()?)
+            .map_err(super::map_key_update_error)?;
         Ok(())
     }
 
+    #[cfg(key_update)]
     async fn update_outgoing_secret(&mut self, request_peer: bool) -> io::Result<()> {
-        KeyUpdateRequest::new(request_peer)
+        super::super::tls::KeyUpdateRequest::new(request_peer)
             .into_message()
             .write(self.stream()?)
             .await?;
-        self.session.update_tx_secret()?.set(self.stream()?)?;
+        self.session
+            .update_tx_secret()?
+            .set(self.stream()?)
+            .map_err(super::map_key_update_error)?;
         Ok(())
     }
 }
@@ -267,6 +275,17 @@ where
                 }
             },
         }
+    }
+}
+
+impl<S, C> KtlsDuplexStream<S, C>
+where
+    S: AsyncWrite + AsyncReadAncillary + AsyncWriteAncillary + AsFd,
+    C: TlsSession,
+{
+    #[cfg(key_update)]
+    pub(crate) async fn key_update(&mut self, request_peer: bool) -> io::Result<()> {
+        self.update_outgoing_secret(request_peer).await
     }
 }
 
