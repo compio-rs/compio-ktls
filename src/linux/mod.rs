@@ -8,6 +8,8 @@ use compio_io::{AsyncRead, AsyncReadExt};
 use ktls_core::{ExtractedSecrets, TlsCryptoInfoRx, TlsCryptoInfoTx, TlsSession, setup_tls_params};
 
 mod adaptor;
+#[cfg(feature = "openssl")]
+mod ossl;
 #[cfg(feature = "rustls")]
 mod rtls;
 mod stream;

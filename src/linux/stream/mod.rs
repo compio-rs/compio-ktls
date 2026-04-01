@@ -12,8 +12,7 @@ use ktls_core::AlertDescription;
 
 pub(crate) use self::{duplex::*, split::*};
 use super::tls::{
-    AlertMessage, HandshakeMessage, IntoMessage, KeyUpdateRequest, ReadMessage, TlsMessage,
-    WriteMessage,
+    AlertMessage, HandshakeMessage, IntoMessage, ReadMessage, TlsMessage, WriteMessage,
 };
 
 mod duplex;
@@ -35,8 +34,10 @@ trait KtlsImplementation: Sized {
 
     async fn handle_new_session_ticket(&mut self, payload: &[u8]) -> io::Result<()>;
 
+    #[cfg(key_update)]
     async fn update_incoming_secret(&mut self) -> io::Result<()>;
 
+    #[cfg(key_update)]
     async fn update_outgoing_secret(&mut self, request_peer: bool) -> io::Result<()>;
 
     async fn inspect_error<T>(&mut self, err: io::Error) -> io::Result<T> {
@@ -105,6 +106,7 @@ trait KtlsImplementation: Sized {
     async fn handle_handshake_messages(&mut self, msg: HandshakeMessage<'_>) -> io::Result<()> {
         match msg {
             HandshakeMessage::NewSessionTicket(buf) => self.handle_new_session_ticket(&buf).await,
+            #[cfg(key_update)]
             HandshakeMessage::KeyUpdate(req) => {
                 self.update_incoming_secret().await?;
                 if req.requested() {
@@ -146,5 +148,18 @@ impl OutgoingState {
     #[inline]
     fn is_open(&self) -> bool {
         matches!(self, Self::Open)
+    }
+}
+
+#[cfg(key_update)]
+fn map_key_update_error(e: ktls_core::Error) -> io::Error {
+    match e {
+        ktls_core::Error::CryptoMaterial(e) if e.kind() == io::ErrorKind::ResourceBusy => {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "kernel doesn't support key update",
+            )
+        }
+        e => e.into(),
     }
 }

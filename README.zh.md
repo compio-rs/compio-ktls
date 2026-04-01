@@ -11,7 +11,7 @@
 
 - 基于 [ktls-core](https://github.com/hanyu-dev/ktls) 实现
 - 不锁定特定的 Compio 运行时实现
-- 可插拔的 TLS 实现（目前支持 Rustls）
+- 可插拔的 TLS 实现（目前支持 Rustls 和 OpenSSL）
 - 目前仅支持 TLS 1.3
 - 支持 NewSessionTicket、KeyUpdate 和 Alert 消息处理
 - 支持读写分离（不是那种读写互斥式的），实现真正意义上的并发 I/O
@@ -19,14 +19,21 @@
 ## 可选 features
 
 - `rustls`（默认）：启用 Rustls 集成
+- `openssl`：启用 OpenSSL 集成。使用 `openssl` crate，需要系统已安装 OpenSSL。
 - `ring`：使用 ring 作为加密后端
 - `app-write-with-empty-ancillary`：在写入应用数据时使用 `write_with_ancillary()` 而非
   `write()`。compio-rs/compio#756 引入了 io-uring 的零拷贝写入，改变了 `write()`
   的默认行为，而这会在启用了 kTLS 的 socket 上出错。因此，使用 io-uring 时，应启用该 feature
   来绕过 zero-copy 写入与 kTLS 的冲突。
+- `key_update`：启用 kTLS 密钥更新支持（需要 Linux 6.14+）。交叉编译目标为 6.14+ 内核时可手动指定此
+  feature 来强制启用。本机构建通常不需要手动设置——用 `detect_key_update_at_build` 就好。
+- `detect_key_update_at_build`：当构建宿主机为 Linux 时，在编译时探测内核版本。如果内核版本为
+  6.14 或更高，则自动启用密钥更新支持；反之即使 `key_update` feature 已开启也会被覆盖为关闭。当宿主机不是
+  Linux 时（如从 macOS 交叉编译），此 feature 无效，直接看 `key_update` feature。推荐在本机构建和
+  CI 中使用，默认开启。
 - `sync`：单线程无须开启，多线程才需要。仅对读写分离有用。
 
-（所以基本上就是，除非你自己指定 `compio/polling`，不然所有 feature 都得启用就对了，除了 `sync`）
+（所以基本上就是，除非你自己指定 `compio/polling`，不然所有 feature 都启用就对了，除了 `sync`）
 
 ## 使用方法
 
@@ -83,7 +90,9 @@ lsmod | grep tls
 sudo modprobe tls
 ```
 
-另需 Rustls 启用 `enable_secret_extraction`：
+### Rustls
+
+Rustls 需启用 `enable_secret_extraction`：
 
 ```rust
 use std::sync::Arc;
@@ -97,6 +106,29 @@ let mut config = ClientConfig::builder()
 config.enable_secret_extraction = true;
 
 let config = Arc::new(config);
+```
+
+### OpenSSL
+
+使用 `openssl` feature 时，compio-ktls 需要从 OpenSSL 的 `SSL` 结构体中提取 TLS traffic
+secrets 来配置 kTLS。由于 OpenSSL 没有提供公开 API，本库直接在结构体内存中搜索 secrets——通过
+**`MemmemMode`** 设置来控制搜索方式：
+
+| 模式 | 工作方式 | 权衡                                        |
+|------|---------|-------------------------------------------|
+| `Fork`（默认） | fork 子进程安全地扫描 `SSL` 结构体内存 | 安全；不依赖分配器实现                               |
+| `AssumeLibc` | 通过 `malloc_usable_size` 获取可读范围，在进程内直接扫描 | 无需 fork，但要求 OpenSSL 使用 libc `malloc` 分配内存 |
+| `AssumeLibcAndFork` | 用 `malloc_usable_size` 确定可读范围（同 `AssumeLibc`），但通过 fork 扫描（同 `Fork`） | 比纯 `Fork` 读取边界更精确，同时 fork 保证安全            |
+
+探测到的 offset 会全局缓存（`OnceLock`），开销只在第一次连接时产生，后续连接直接复用缓存结果。
+
+默认使用 `Fork`，开箱即用。如需切换，可以通过 `set_memmem_mode` 设置：
+
+```rust
+use compio_ktls::{KtlsConnector, MemmemMode};
+
+let mut connector = KtlsConnector::from(ssl_connector);
+connector.set_memmem_mode(MemmemMode::AssumeLibc);
 ```
 
 ## 致谢

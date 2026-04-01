@@ -551,6 +551,183 @@ mod ktls_tests {
         }
     }
 
+    /// Test full kTLS key update: client initiates key update mid-stream
+    #[compio::test]
+    #[cfg(key_update)]
+    async fn test_full_ktls_key_update() {
+        let cert_pem = std::fs::read("tests/fixtures/cert.pem").unwrap();
+        let key_pem = std::fs::read("tests/fixtures/key.pem").unwrap();
+        let certs = rustls_pemfile::certs(&mut cert_pem.as_slice())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
+            .unwrap()
+            .unwrap();
+
+        let mut server_config = rustls::server::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
+        server_config.enable_secret_extraction = true;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        compio::runtime::spawn(async move {
+            let acceptor = KtlsAcceptor::from(Arc::new(server_config));
+            let (stream, _) = listener.accept().await.unwrap();
+
+            match acceptor.accept(stream).await.unwrap() {
+                Ok(mut ktls_stream) => {
+                    // Echo loop: read and echo back until EOF
+                    loop {
+                        let buf = vec![0u8; 1024];
+                        let (n, buf) = ktls_stream.read(buf).await.unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        ktls_stream.write_all(buf[..n].to_vec()).await.unwrap();
+                        ktls_stream.flush().await.unwrap();
+                    }
+                    ktls_stream.shutdown().await.ok();
+                }
+                Err(mut stream) => {
+                    stream.shutdown().await.ok();
+                }
+            }
+        })
+        .detach();
+
+        let mut client_config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        client_config.enable_secret_extraction = true;
+
+        let connector = KtlsConnector::from(Arc::new(client_config));
+        let stream = TcpStream::connect(addr).await.unwrap();
+
+        match connector.connect("localhost", stream).await.unwrap() {
+            Ok(mut ktls_stream) => {
+                // Send data before key update
+                let msg1 = b"Before key update";
+                ktls_stream.write_all(msg1.to_vec()).await.unwrap();
+                ktls_stream.flush().await.unwrap();
+
+                let (n, buf) = ktls_stream.read(vec![0u8; 1024]).await.unwrap();
+                assert_eq!(&buf[..n], msg1);
+
+                // Initiate key update
+                ktls_stream.key_update(true).await.unwrap();
+
+                // Send data after key update
+                let msg2 = b"After key update";
+                ktls_stream.write_all(msg2.to_vec()).await.unwrap();
+                ktls_stream.flush().await.unwrap();
+
+                let (n, buf) = ktls_stream.read(vec![0u8; 1024]).await.unwrap();
+                assert_eq!(&buf[..n], msg2);
+
+                ktls_stream.shutdown().await.ok();
+            }
+            Err(stream) => {
+                drop(stream);
+                eprintln!("Warning: kTLS not available on this system");
+            }
+        }
+    }
+
+    /// Test full kTLS key update with split streams: write half initiates key
+    /// update
+    #[compio::test]
+    #[cfg(key_update)]
+    async fn test_full_ktls_key_update_split() {
+        use compio::io::{AsyncReadExt, util::Splittable};
+
+        let cert_pem = std::fs::read("tests/fixtures/cert.pem").unwrap();
+        let key_pem = std::fs::read("tests/fixtures/key.pem").unwrap();
+        let certs = rustls_pemfile::certs(&mut cert_pem.as_slice())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
+            .unwrap()
+            .unwrap();
+
+        let mut server_config = rustls::server::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
+        server_config.enable_secret_extraction = true;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        compio::runtime::spawn(async move {
+            let acceptor = KtlsAcceptor::from(Arc::new(server_config));
+            let (stream, _) = listener.accept().await.unwrap();
+
+            match acceptor.accept(stream).await.unwrap() {
+                Ok(ktls_stream) => {
+                    let (mut reader, mut writer) = ktls_stream.split();
+
+                    let read_task =
+                        compio::runtime::spawn(
+                            async move { reader.read_to_end(vec![]).await.unwrap() },
+                        );
+
+                    let (n, buf) = read_task.await.unwrap();
+                    writer.write_all(buf[..n].to_vec()).await.unwrap();
+                    writer.flush().await.unwrap();
+                    writer.shutdown().await.ok();
+                }
+                Err(mut stream) => {
+                    stream.shutdown().await.ok();
+                }
+            }
+        })
+        .detach();
+
+        let mut client_config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        client_config.enable_secret_extraction = true;
+
+        let connector = KtlsConnector::from(Arc::new(client_config));
+        let stream = TcpStream::connect(addr).await.unwrap();
+
+        match connector.connect("localhost", stream).await.unwrap() {
+            Ok(ktls_stream) => {
+                let (mut reader, mut writer) = ktls_stream.split();
+
+                let read_task =
+                    compio::runtime::spawn(
+                        async move { reader.read_to_end(vec![]).await.unwrap() },
+                    );
+
+                let msg1 = b"Before key update split";
+                writer.write_all(msg1.to_vec()).await.unwrap();
+                writer.flush().await.unwrap();
+
+                // Initiate key update via write half
+                writer.key_update(true).await.unwrap();
+
+                let msg2 = b"After key update split";
+                writer.write_all(msg2.to_vec()).await.unwrap();
+                writer.flush().await.unwrap();
+                writer.shutdown().await.unwrap();
+
+                let (n, buf) = read_task.await.unwrap();
+                let expected: Vec<u8> = [msg1.as_slice(), msg2.as_slice()].concat();
+                assert_eq!(&buf[..n], &expected[..]);
+            }
+            Err(stream) => {
+                drop(stream);
+                eprintln!("Warning: kTLS not available on this system");
+            }
+        }
+    }
+
     #[derive(Debug)]
     struct NoVerifier;
 

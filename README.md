@@ -11,7 +11,7 @@ Kernel TLS (kTLS) support for [Compio](https://github.com/compio-rs/compio).
 
 - Built on top of [ktls-core](https://github.com/hanyu-dev/ktls)
 - Not tied to any specific Compio runtime implementation
-- Pluggable TLS implementations (currently supports Rustls)
+- Pluggable TLS implementations (currently supports Rustls and OpenSSL)
 - Currently supports TLS 1.3 only
 - Supports NewSessionTicket, KeyUpdate, and Alert message handling
 - Supports splitting `KtlsStream` into read/write halves for concurrent I/O
@@ -19,12 +19,22 @@ Kernel TLS (kTLS) support for [Compio](https://github.com/compio-rs/compio).
 ## Features
 
 - `rustls` (default): Enable Rustls integration
+- `openssl`: Enable OpenSSL integration. This uses the `openssl` crate and requires OpenSSL
+  to be installed on the system.
 - `ring`: Use ring as the crypto backend
 - `app-write-with-empty-ancillary`: Use `write_with_ancillary()` instead of `write()` for
   application data writes. compio-rs/compio#756 introduced zero-copy writes for io-uring,
   which changed the default behavior of `write()` in a way that breaks on kTLS-enabled
   sockets. Enable this feature when using io-uring to work around the conflict between
   zero-copy writes and kTLS.
+- `key_update`: Enable kTLS key update support (requires Linux 6.14+). Use this to
+  force-enable key update when cross-compiling for a 6.14+ target. On native builds you
+  typically don't need to set this manually — use `detect_key_update_at_build` instead.
+- `detect_key_update_at_build`: When the build host is Linux, probe the kernel version at
+  compile time. If the kernel is >= 6.14, key update support is enabled automatically;
+  otherwise it is disabled even if the `key_update` feature is on. When the build host is not
+  Linux (e.g. cross-compiling from macOS), this feature has no effect and the `key_update`
+  feature is respected as-is. This is the recommended mode for native builds and CI.
 - `sync`: Use thread-safe locks for the split read/write halves. By default, single-threaded
   (unsync) locks are used. Enable this feature if you need to use the split halves across
   threads.
@@ -82,7 +92,9 @@ If not loaded, you can manually load it:
 sudo modprobe tls
 ```
 
-Also requires Rustls with `enable_secret_extraction` enabled:
+### Rustls
+
+With Rustls, `enable_secret_extraction` is required:
 
 ```rust
 use std::sync::Arc;
@@ -96,6 +108,32 @@ let mut config = ClientConfig::builder()
 config.enable_secret_extraction = true;
 
 let config = Arc::new(config);
+```
+
+### OpenSSL
+
+When using the `openssl` feature, compio-ktls needs to extract TLS traffic secrets from the
+OpenSSL `SSL` struct in order to configure kTLS. Because OpenSSL does not expose a public API
+for this, the library searches for the secrets directly in the struct's memory — this is
+controlled by the **`MemmemMode`** setting:
+
+| Mode | How it works | Trade-off |
+|------|-------------|-----------|
+| `Fork` (default) | Forks a child process to safely scan the `SSL` struct memory | Safe; assumes nothing about the allocator |
+| `AssumeLibc` | Uses `malloc_usable_size` to determine the readable range, then scans in-process | No fork, but assumes OpenSSL allocates with libc `malloc` |
+| `AssumeLibcAndFork` | Uses `malloc_usable_size` for the readable range (like `AssumeLibc`), but scans via fork (like `Fork`) | Tighter read bound than pure `Fork`, still fork-safe |
+
+The probed offsets are cached globally (`OnceLock`), so the cost is only paid once — on the
+first connection. Subsequent connections reuse the cached result regardless of mode.
+
+The default is `Fork`, which works out of the box. You can switch to a different mode with
+`set_memmem_mode`:
+
+```rust
+use compio_ktls::{KtlsConnector, MemmemMode};
+
+let mut connector = KtlsConnector::from(ssl_connector);
+connector.set_memmem_mode(MemmemMode::AssumeLibc);
 ```
 
 ## License
