@@ -307,8 +307,8 @@ pub(crate) fn rs_probe_tls13_secret_offsets(mode: MemmemMode) -> io::Result<(usi
     };
 
     // Load private key
-    let pem = include_bytes!("key.pem");
-    let pkey = PKey::private_key_from_pem(pem.as_ref())?;
+    let key_der = include_bytes!("key.der");
+    let pkey = PKey::private_key_from_der(key_der.as_ref())?;
 
     // Construct a short-lived self-signed certificate
     use openssl::{asn1::Asn1Time, bn::BigNum, hash::MessageDigest, x509::X509Builder};
