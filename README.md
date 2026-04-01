@@ -27,13 +27,14 @@ Kernel TLS (kTLS) support for [Compio](https://github.com/compio-rs/compio).
   which changed the default behavior of `write()` in a way that breaks on kTLS-enabled
   sockets. Enable this feature when using io-uring to work around the conflict between
   zero-copy writes and kTLS.
-- `key_update`: Enable kTLS key update support (requires Linux 6.13+). Use this to
-  force-enable key update when cross-compiling for a 6.13+ target. On native builds you
+- `key_update`: Enable kTLS key update support (requires Linux 6.14+). Use this to
+  force-enable key update when cross-compiling for a 6.14+ target. On native builds you
   typically don't need to set this manually — use `detect_key_update_at_build` instead.
-- `detect_key_update_at_build`: Probe the build-host kernel version at compile time. If the
-  running kernel is >= 6.13, key update support is enabled automatically; otherwise it is
-  disabled even if the `key_update` feature is on. This is the recommended mode for native
-  builds and CI.
+- `detect_key_update_at_build`: When the build host is Linux, probe the kernel version at
+  compile time. If the kernel is >= 6.14, key update support is enabled automatically;
+  otherwise it is disabled even if the `key_update` feature is on. When the build host is not
+  Linux (e.g. cross-compiling from macOS), this feature has no effect and the `key_update`
+  feature is respected as-is. This is the recommended mode for native builds and CI.
 - `sync`: Use thread-safe locks for the split read/write halves. By default, single-threaded
   (unsync) locks are used. Enable this feature if you need to use the split halves across
   threads.
@@ -91,7 +92,9 @@ If not loaded, you can manually load it:
 sudo modprobe tls
 ```
 
-Also requires Rustls with `enable_secret_extraction` enabled:
+### Rustls
+
+With Rustls, `enable_secret_extraction` is required:
 
 ```rust
 use std::sync::Arc;

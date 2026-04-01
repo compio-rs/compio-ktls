@@ -25,10 +25,12 @@
   `write()`。compio-rs/compio#756 引入了 io-uring 的零拷贝写入，改变了 `write()`
   的默认行为，而这会在启用了 kTLS 的 socket 上出错。因此，使用 io-uring 时，应启用该 feature
   来绕过 zero-copy 写入与 kTLS 的冲突。
-- `key_update`：启用 kTLS 密钥更新支持（需要 Linux 6.13+）。交叉编译目标为 6.13+ 内核时可手动
-  指定此 feature 来强制启用。本机构建通常不需要手动设置——用 `detect_key_update_at_build` 就好。
-- `detect_key_update_at_build`：在编译时探测宿主机的内核版本。如果内核 >= 6.13，则自动启用密钥
-  更新支持；反之即使 `key_update` feature 已开启也会被覆盖关闭。推荐在本机构建和 CI 中使用。
+- `key_update`：启用 kTLS 密钥更新支持（需要 Linux 6.14+）。交叉编译目标为 6.14+ 内核时可手动指定此
+  feature 来强制启用。本机构建通常不需要手动设置——用 `detect_key_update_at_build` 就好。
+- `detect_key_update_at_build`：当构建宿主机为 Linux 时，在编译时探测内核版本。如果内核版本为
+  6.14 或更高，则自动启用密钥更新支持；反之即使 `key_update` feature 已开启也会被覆盖为关闭。当宿主机不是
+  Linux 时（如从 macOS 交叉编译），此 feature 无效，直接看 `key_update` feature。推荐在本机构建和
+  CI 中使用，默认开启。
 - `sync`：单线程无须开启，多线程才需要。仅对读写分离有用。
 
 （所以基本上就是，除非你自己指定 `compio/polling`，不然所有 feature 都启用就对了，除了 `sync`）
@@ -88,7 +90,9 @@ lsmod | grep tls
 sudo modprobe tls
 ```
 
-另需 Rustls 启用 `enable_secret_extraction`：
+### Rustls
+
+Rustls 需启用 `enable_secret_extraction`：
 
 ```rust
 use std::sync::Arc;

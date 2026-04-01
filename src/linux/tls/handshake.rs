@@ -7,6 +7,8 @@ use compio_buf::{BufResult, IoBuf, IoBufMut, buf_try};
 use compio_io::ancillary::{AsyncReadAncillary, AsyncWriteAncillary};
 use ktls_core::ContentType;
 
+#[cfg(key_update)]
+pub(crate) use self::key_update::KeyUpdateRequest;
 use super::{AsyncWriteAncillaryExt, Message, ReadMessage, WriteMessage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,66 +206,6 @@ impl fmt::Debug for HandshakeMessage<'_> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-#[cfg(key_update)]
-enum KeyUpdateRequestInner {
-    UpdateNotRequested = 0,
-    UpdateRequested    = 1,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg(key_update)]
-pub(crate) struct KeyUpdateRequest(KeyUpdateRequestInner);
-
-#[cfg(key_update)]
-impl KeyUpdateRequest {
-    const SIZE: usize = 1;
-
-    pub(crate) fn new(request_peer: bool) -> Self {
-        use KeyUpdateRequestInner::*;
-        if request_peer {
-            Self(UpdateRequested)
-        } else {
-            Self(UpdateNotRequested)
-        }
-    }
-
-    #[cfg(key_update)]
-    pub(crate) fn requested(&self) -> bool {
-        matches!(self.0, KeyUpdateRequestInner::UpdateRequested)
-    }
-
-    fn decode(buf: &[u8]) -> io::Result<Self> {
-        use KeyUpdateRequestInner::*;
-        match buf {
-            [v] if *v == UpdateNotRequested as u8 => Ok(Self(UpdateNotRequested)),
-            [v] if *v == UpdateRequested as u8 => Ok(Self(UpdateRequested)),
-            [v] => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Unknown key update request: {v:x}"),
-            )),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Invalid KeyUpdate message length: {}", buf.len()),
-            )),
-        }
-    }
-
-    fn encode(self) -> [u8; Self::SIZE] {
-        [self.0 as u8]
-    }
-}
-
-#[cfg(key_update)]
-impl super::IntoMessage for KeyUpdateRequest {
-    type Message = HandshakeMessage<'static>;
-
-    fn into_message(self) -> Self::Message {
-        HandshakeMessage::KeyUpdate(self)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,67 +242,129 @@ mod tests {
         #[cfg(key_update)]
         assert!(!HandshakeType::KeyUpdate.allowed_length_range().contains(&2));
     }
+}
 
-    #[test]
-    #[cfg(key_update)]
-    fn test_handshake_header_encode_decode() {
-        let header = HandshakeHeader {
-            ty: HandshakeType::KeyUpdate,
-            payload_length: 1,
-        };
-        let encoded = header.encode();
-        assert_eq!(encoded[0], 24); // KeyUpdate type
-        assert_eq!(u32::from_be_bytes(encoded) & 0x00FFFFFF, 1); // Length
+#[cfg(key_update)]
+mod key_update {
+    use std::io;
 
-        let decoded = HandshakeHeader::decode(&encoded).unwrap();
-        assert_eq!(decoded.ty, HandshakeType::KeyUpdate);
-        assert_eq!(decoded.payload_length, 1);
+    use super::{super::IntoMessage, *};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[repr(u8)]
+    enum KeyUpdateRequestInner {
+        UpdateNotRequested = 0,
+        UpdateRequested    = 1,
     }
 
-    #[test]
-    #[cfg(key_update)]
-    fn test_handshake_header_invalid_length() {
-        let mut buf = [0u8; 4];
-        buf[0] = 24; // KeyUpdate type
-        // Payload length = 2, which is outside allowed range
-        buf[1..4].copy_from_slice(&2u32.to_be_bytes()[1..4]);
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct KeyUpdateRequest(KeyUpdateRequestInner);
 
-        assert!(HandshakeHeader::decode(&buf).is_err());
+    impl KeyUpdateRequest {
+        const SIZE: usize = 1;
+
+        pub(crate) fn new(request_peer: bool) -> Self {
+            use KeyUpdateRequestInner::*;
+            if request_peer {
+                Self(UpdateRequested)
+            } else {
+                Self(UpdateNotRequested)
+            }
+        }
+
+        pub(crate) fn requested(&self) -> bool {
+            matches!(self.0, KeyUpdateRequestInner::UpdateRequested)
+        }
+
+        pub(super) fn decode(buf: &[u8]) -> io::Result<Self> {
+            use KeyUpdateRequestInner::*;
+            match buf {
+                [v] if *v == UpdateNotRequested as u8 => Ok(Self(UpdateNotRequested)),
+                [v] if *v == UpdateRequested as u8 => Ok(Self(UpdateRequested)),
+                [v] => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Unknown key update request: {v:x}"),
+                )),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Invalid KeyUpdate message length: {}", buf.len()),
+                )),
+            }
+        }
+
+        pub(super) fn encode(self) -> [u8; Self::SIZE] {
+            [self.0 as u8]
+        }
     }
 
-    #[test]
-    #[cfg(key_update)]
-    fn test_key_update_request_new() {
-        let req = KeyUpdateRequest::new(false);
-        assert!(!req.requested());
-        assert_eq!(req.0, KeyUpdateRequestInner::UpdateNotRequested);
+    impl IntoMessage for KeyUpdateRequest {
+        type Message = HandshakeMessage<'static>;
 
-        let req = KeyUpdateRequest::new(true);
-        assert!(req.requested());
-        assert_eq!(req.0, KeyUpdateRequestInner::UpdateRequested);
+        fn into_message(self) -> Self::Message {
+            HandshakeMessage::KeyUpdate(self)
+        }
     }
 
-    #[test]
-    #[cfg(key_update)]
-    fn test_key_update_request_encode_decode() {
-        let req = KeyUpdateRequest::new(false);
-        let encoded = req.encode();
-        assert_eq!(encoded, [0]);
-        let decoded = KeyUpdateRequest::decode(&encoded).unwrap();
-        assert_eq!(decoded, req);
+    #[cfg(test)]
+    mod tests {
+        use super::*;
 
-        let req = KeyUpdateRequest::new(true);
-        let encoded = req.encode();
-        assert_eq!(encoded, [1]);
-        let decoded = KeyUpdateRequest::decode(&encoded).unwrap();
-        assert_eq!(decoded, req);
-    }
+        #[test]
+        fn test_handshake_header_encode_decode() {
+            let header = HandshakeHeader {
+                ty: HandshakeType::KeyUpdate,
+                payload_length: 1,
+            };
+            let encoded = header.encode();
+            assert_eq!(encoded[0], 24); // KeyUpdate type
+            assert_eq!(u32::from_be_bytes(encoded) & 0x00FFFFFF, 1); // Length
 
-    #[test]
-    #[cfg(key_update)]
-    fn test_key_update_request_decode_invalid() {
-        assert!(KeyUpdateRequest::decode(&[2]).is_err());
-        assert!(KeyUpdateRequest::decode(&[0, 1]).is_err());
-        assert!(KeyUpdateRequest::decode(&[]).is_err());
+            let decoded = HandshakeHeader::decode(&encoded).unwrap();
+            assert_eq!(decoded.ty, HandshakeType::KeyUpdate);
+            assert_eq!(decoded.payload_length, 1);
+        }
+
+        #[test]
+        fn test_handshake_header_invalid_length() {
+            let mut buf = [0u8; 4];
+            buf[0] = 24; // KeyUpdate type
+            // Payload length = 2, which is outside allowed range
+            buf[1..4].copy_from_slice(&2u32.to_be_bytes()[1..4]);
+
+            assert!(HandshakeHeader::decode(&buf).is_err());
+        }
+
+        #[test]
+        fn test_key_update_request_new() {
+            let req = KeyUpdateRequest::new(false);
+            assert!(!req.requested());
+            assert_eq!(req.0, KeyUpdateRequestInner::UpdateNotRequested);
+
+            let req = KeyUpdateRequest::new(true);
+            assert!(req.requested());
+            assert_eq!(req.0, KeyUpdateRequestInner::UpdateRequested);
+        }
+
+        #[test]
+        fn test_key_update_request_encode_decode() {
+            let req = KeyUpdateRequest::new(false);
+            let encoded = req.encode();
+            assert_eq!(encoded, [0]);
+            let decoded = KeyUpdateRequest::decode(&encoded).unwrap();
+            assert_eq!(decoded, req);
+
+            let req = KeyUpdateRequest::new(true);
+            let encoded = req.encode();
+            assert_eq!(encoded, [1]);
+            let decoded = KeyUpdateRequest::decode(&encoded).unwrap();
+            assert_eq!(decoded, req);
+        }
+
+        #[test]
+        fn test_key_update_request_decode_invalid() {
+            assert!(KeyUpdateRequest::decode(&[2]).is_err());
+            assert!(KeyUpdateRequest::decode(&[0, 1]).is_err());
+            assert!(KeyUpdateRequest::decode(&[]).is_err());
+        }
     }
 }

@@ -5,7 +5,7 @@ use std::{array, io, io::Read};
 
 use compio_buf::{IoBuf, Slice, buf_try};
 use compio_io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use ktls_core::{AeadKey, ConnectionTrafficSecrets};
+use ktls_core::{AeadKey, ConnectionTrafficSecrets, ContentType, ProtocolVersion};
 
 pub use self::prober::MemmemMode;
 #[cfg(feature = "openssl")]
@@ -58,10 +58,10 @@ impl CipherKind {
 
     const fn max_size() -> usize {
         let all_kinds = [
-            CipherKind::Aes128Gcm,
-            CipherKind::Aes256Gcm,
-            CipherKind::Aes128Ccm,
-            CipherKind::ChaCha20Poly1305,
+            Self::Aes128Gcm,
+            Self::Aes256Gcm,
+            Self::Aes128Ccm,
+            Self::ChaCha20Poly1305,
         ];
         let mut max = 0;
         let mut i = 0;
@@ -78,7 +78,8 @@ impl CipherKind {
 }
 
 /// RecordStream is an adapted copy of [compio_io::compat::SyncStream] that only
-/// reads whole TLS record from the inner stream.
+/// reads whole TLS record from the inner stream. It also supports feeding data
+/// manually for OpenSSL to consume.
 struct RecordStream<S>(Option<RecordStreamInner<S>>);
 
 struct RecordStreamInner<S> {
@@ -123,19 +124,19 @@ impl<S> RecordStream<S> {
         }
     }
 
+    fn take_stream(&mut self) -> io::Result<S> {
+        self.borrow_mut()?
+            .stream
+            .take()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, STREAM_UPGRADED))
+    }
+
     fn put(&mut self, stream: Option<S>, read_buf: Slice<Vec<u8>>, write_buf: Vec<u8>) {
         self.0 = Some(RecordStreamInner {
             stream,
             read_buf,
             write_buf,
         });
-    }
-
-    fn take_stream(&mut self) -> io::Result<S> {
-        self.borrow_mut()?
-            .stream
-            .take()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, STREAM_UPGRADED))
     }
 
     fn feed(&mut self, data: &[u8]) -> io::Result<()> {
@@ -222,18 +223,34 @@ impl<S> io::Write for RecordStream<S> {
     }
 }
 
-#[derive(Debug)]
-struct TrafficSecrets {
-    cipher_kind: CipherKind,
-    buf: [u8; CipherKind::max_size()],
+trait Encryptor {
+    fn tls13_hkdf_expand(&self, secret: &[u8], label: &[u8], out: &mut [u8]) -> io::Result<()>;
+
+    fn encrypt_aead(
+        &self,
+        cipher_kind: CipherKind,
+        key: &[u8],
+        nonce: &[u8],
+        aad: &[u8],
+        inner_plaintext: &[u8],
+        tag: &mut [u8],
+    ) -> io::Result<Vec<u8>>;
 }
 
-impl TrafficSecrets {
-    fn new(cipher_kind: CipherKind) -> Self {
+#[derive(Debug)]
+struct TrafficSecrets<E> {
+    cipher_kind: CipherKind,
+    buf: [u8; CipherKind::max_size()],
+    encryptor: E,
+}
+
+impl<E> TrafficSecrets<E> {
+    fn new(cipher_kind: CipherKind, encryptor: E) -> Self {
         // Use adt_const_params once stabilized
         Self {
             cipher_kind,
             buf: [0; CipherKind::max_size()],
+            encryptor,
         }
     }
 
@@ -254,17 +271,72 @@ impl TrafficSecrets {
     }
 }
 
-impl Drop for TrafficSecrets {
+impl<E: Encryptor> TrafficSecrets<E> {
+    fn derive_tls13_key_and_iv(&mut self, secret: &[u8]) -> io::Result<&Self> {
+        let key_size = self.cipher_kind.key_size();
+        let salt_size = self.cipher_kind.salt_size();
+        let iv_size = self.cipher_kind.iv_size();
+
+        let out = &mut self.buf[0..key_size];
+        self.encryptor.tls13_hkdf_expand(secret, b"key", out)?;
+
+        let out = &mut self.buf[key_size..key_size + salt_size + iv_size];
+        self.encryptor.tls13_hkdf_expand(secret, b"iv", out)?;
+        Ok(self)
+    }
+
+    fn encrypt_tls13_record(&self, inner_plaintext: &[u8], seq: u64) -> io::Result<[Vec<u8>; 3]> {
+        // Construct nonce = (salt || iv) XOR padded_seq
+        let salt = self.salt();
+        let iv = self.iv();
+        let nonce_len = salt.len() + iv.len();
+        let mut nonce = Vec::with_capacity(nonce_len);
+        nonce.extend_from_slice(salt);
+        nonce.extend_from_slice(iv);
+        let seq_be = seq.to_be_bytes();
+        let seq_be_len = seq_be.len();
+        assert!(nonce_len >= seq_be_len);
+        seq_be
+            .into_iter()
+            .zip(nonce.iter_mut().skip(nonce_len - seq_be_len))
+            .for_each(|(s, n)| *n ^= s);
+
+        // AAD = TLS record header
+        const TAG_LEN: usize = 16;
+        let encrypted_len: u16 = (inner_plaintext.len() + TAG_LEN)
+            .try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many bytes"))?;
+        let mut aad = Vec::new();
+        aad.push(ContentType::ApplicationData.into());
+        aad.extend_from_slice(&u16::from(ProtocolVersion::TLSv1_2).to_be_bytes());
+        aad.extend_from_slice(&encrypted_len.to_be_bytes());
+
+        // AEAD-encrypt
+        let mut tag = vec![0u8; TAG_LEN];
+        let ciphertext = self.encryptor.encrypt_aead(
+            self.cipher_kind,
+            self.key(),
+            &nonce,
+            &aad,
+            inner_plaintext,
+            &mut tag,
+        )?;
+
+        Ok([aad, ciphertext, tag])
+    }
+}
+
+impl<E> Drop for TrafficSecrets<E> {
     fn drop(&mut self) {
         self.buf.fill(0);
         std::hint::black_box(&self.buf);
     }
 }
 
-impl TryFrom<&TrafficSecrets> for ConnectionTrafficSecrets {
+impl<E> TryFrom<&TrafficSecrets<E>> for ConnectionTrafficSecrets {
     type Error = array::TryFromSliceError;
 
-    fn try_from(secrets: &TrafficSecrets) -> Result<Self, Self::Error> {
+    fn try_from(secrets: &TrafficSecrets<E>) -> Result<Self, Self::Error> {
         match secrets.cipher_kind {
             CipherKind::Aes128Gcm => Ok(Self::Aes128Gcm {
                 key: AeadKey::new(secrets.key().try_into()?),
@@ -291,26 +363,26 @@ impl TryFrom<&TrafficSecrets> for ConnectionTrafficSecrets {
 }
 
 #[derive(Debug)]
-struct Secrets {
-    incoming_secrets: TrafficSecrets,
-    outgoing_secrets: TrafficSecrets,
+struct Secrets<E> {
+    incoming_secrets: TrafficSecrets<E>,
+    outgoing_secrets: TrafficSecrets<E>,
     tx_seq: u64,
 }
 
-impl Secrets {
-    fn new(cipher_kind: CipherKind) -> Self {
+impl<E: Copy> Secrets<E> {
+    fn new(cipher_kind: CipherKind, encryptor: E) -> Self {
         Self {
-            incoming_secrets: TrafficSecrets::new(cipher_kind),
-            outgoing_secrets: TrafficSecrets::new(cipher_kind),
+            incoming_secrets: TrafficSecrets::new(cipher_kind, encryptor),
+            outgoing_secrets: TrafficSecrets::new(cipher_kind, encryptor),
             tx_seq: 0,
         }
     }
 }
 
-impl TryFrom<Secrets> for ktls_core::ExtractedSecrets {
+impl<E> TryFrom<Secrets<E>> for ktls_core::ExtractedSecrets {
     type Error = ktls_core::Error;
 
-    fn try_from(secrets: Secrets) -> Result<Self, Self::Error> {
+    fn try_from(secrets: Secrets<E>) -> Result<Self, Self::Error> {
         let tx_secrets = (&secrets.outgoing_secrets)
             .try_into()
             .map_err(|e| ktls_core::Error::Tls(Box::new(e)))?;

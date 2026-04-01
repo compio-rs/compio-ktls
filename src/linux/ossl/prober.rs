@@ -255,7 +255,7 @@ unsafe fn memmem_child(
 
         // Write the result back to the parent process
         let written = libc::write(output_fd, &i as *const _ as _, USIZE_SIZE);
-        if written == USIZE_SIZE as _ {
+        if written == USIZE_SIZE as libc::ssize_t {
             libc::_exit(libc::EXIT_SUCCESS);
         } else {
             libc::_exit(libc::EXIT_FAILURE);

@@ -12,7 +12,7 @@ use std::{
 };
 
 use compio_io::{AsyncRead, AsyncWrite, ancillary::AsyncWriteAncillary};
-use ktls_core::{ContentType, Peer, ProtocolVersion, TlsCryptoInfoRx, TlsCryptoInfoTx};
+use ktls_core::{Peer, ProtocolVersion, TlsCryptoInfoRx, TlsCryptoInfoTx};
 use openssl::{
     md::{Md, MdRef},
     nid::Nid,
@@ -26,11 +26,11 @@ use openssl::{
 
 use super::{
     super::tls::HandshakeMessage,
-    CipherKind, KtlsDuplexStream, KtlsStream, RecordStream, Secrets, TrafficSecrets,
+    CipherKind, Encryptor, KtlsDuplexStream, KtlsStream, RecordStream, Secrets, TrafficSecrets,
     prober::{MemmemMode, Tls13SecretOffsetProber},
 };
 
-pub(crate) struct KtlsSession<S> {
+pub(crate) struct OpenSslSession<S> {
     ssl_stream: SslStream<RecordStream<S>>,
     protocol_version: ProtocolVersion,
     cipher_kind: CipherKind,
@@ -40,7 +40,7 @@ pub(crate) struct KtlsSession<S> {
     rx_seq: u64,
 }
 
-impl<S> KtlsSession<S> {
+impl<S> OpenSslSession<S> {
     fn from_ssl(ssl_stream: SslStream<RecordStream<S>>, mode: MemmemMode) -> io::Result<Self> {
         let ssl = ssl_stream.ssl();
         let protocol_version = match ssl.version2() {
@@ -64,7 +64,7 @@ impl<S> KtlsSession<S> {
         let cipher_kind = ssl_cipher.try_into()?;
 
         // Cache the secret offsets under tx/rx tags
-        let (client_secret_offset, server_secret_offset) = probe_tls13_secret_offsets(mode)?;
+        let (client_secret_offset, server_secret_offset) = rs_probe_tls13_secret_offsets(mode)?;
         let (outgoing_secret_offset, incoming_secret_offset) = match ssl.is_server() {
             true => (server_secret_offset, client_secret_offset),
             false => (client_secret_offset, server_secret_offset),
@@ -93,12 +93,12 @@ impl<S> KtlsSession<S> {
         unsafe { slice::from_raw_parts(ptr.add(self.outgoing_secret_offset), self.md.size()) }
     }
 
-    fn extract_tls13_secrets(&self) -> io::Result<Secrets> {
-        let mut rv = Secrets::new(self.cipher_kind);
+    fn extract_tls13_secrets(&self) -> io::Result<Secrets<&'static MdRef>> {
+        let mut rv = Secrets::new(self.cipher_kind, self.md);
         rv.outgoing_secrets
-            .tls1_3_derive_key_and_iv(self.md, self.outgoing_secret())?;
+            .derive_tls13_key_and_iv(self.outgoing_secret())?;
         rv.incoming_secrets
-            .tls1_3_derive_key_and_iv(self.md, self.incoming_secret())?;
+            .derive_tls13_key_and_iv(self.incoming_secret())?;
         if self.ssl_stream.ssl().is_server() {
             // This hack depends on OpenSSL implementation detail: each NewSessionTicket
             // message is always encrypted in one TLS record
@@ -113,8 +113,8 @@ impl<S> KtlsSession<S> {
 
     fn feed_message(&mut self, msg: HandshakeMessage) -> io::Result<()> {
         // Re-derive incoming traffic secrets to avoid caching them
-        let mut traffic_secrets = TrafficSecrets::new(self.cipher_kind);
-        traffic_secrets.tls1_3_derive_key_and_iv(self.md, self.incoming_secret())?;
+        let mut traffic_secrets = TrafficSecrets::new(self.cipher_kind, self.md);
+        traffic_secrets.derive_tls13_key_and_iv(self.incoming_secret())?;
 
         // Re-encrypt the plaintext message and feed it back to OpenSSL
         let msg = msg.into_tls13_inner_plaintext()?;
@@ -157,7 +157,7 @@ impl<S> KtlsSession<S> {
     }
 }
 
-impl<S> ktls_core::TlsSession for KtlsSession<S> {
+impl<S> ktls_core::TlsSession for OpenSslSession<S> {
     fn peer(&self) -> Peer {
         match self.ssl_stream.ssl().is_server() {
             true => Peer::Server,
@@ -173,8 +173,8 @@ impl<S> ktls_core::TlsSession for KtlsSession<S> {
     fn update_tx_secret(&mut self) -> ktls_core::error::Result<TlsCryptoInfoTx> {
         self.key_update()
             .map_err(ktls_core::Error::KeyUpdateFailed)?;
-        let secrets = TrafficSecrets::new(self.cipher_kind)
-            .tls1_3_derive_key_and_iv(self.md, self.outgoing_secret())
+        let secrets = TrafficSecrets::new(self.cipher_kind, self.md)
+            .derive_tls13_key_and_iv(self.outgoing_secret())
             .map_err(ktls_core::Error::KeyUpdateFailed)?
             .try_into()
             .map_err(|e| ktls_core::Error::Tls(Box::new(e)))?;
@@ -192,8 +192,8 @@ impl<S> ktls_core::TlsSession for KtlsSession<S> {
         self.feed_message(KeyUpdateRequest::new(false).into_message())
             .map_err(ktls_core::Error::KeyUpdateFailed)?;
         self.rx_seq = 0;
-        let secrets = TrafficSecrets::new(self.cipher_kind)
-            .tls1_3_derive_key_and_iv(self.md, self.incoming_secret())
+        let secrets = TrafficSecrets::new(self.cipher_kind, self.md)
+            .derive_tls13_key_and_iv(self.incoming_secret())
             .map_err(ktls_core::Error::KeyUpdateFailed)?
             .try_into()
             .map_err(|e| ktls_core::Error::Tls(Box::new(e)))?;
@@ -289,62 +289,7 @@ impl From<CipherKind> for symm::Cipher {
     }
 }
 
-impl TrafficSecrets {
-    fn tls1_3_derive_key_and_iv(&mut self, md: &MdRef, secret: &[u8]) -> io::Result<&Self> {
-        let key_size = self.cipher_kind.key_size();
-        let salt_size = self.cipher_kind.salt_size();
-        let iv_size = self.cipher_kind.iv_size();
-
-        let out = &mut self.buf[0..key_size];
-        tls13_hkdf_expand(md, secret, b"key", out)?;
-
-        let out = &mut self.buf[key_size..key_size + salt_size + iv_size];
-        tls13_hkdf_expand(md, secret, b"iv", out)?;
-        Ok(self)
-    }
-
-    fn encrypt_tls13_record(&self, inner_plaintext: &[u8], seq: u64) -> io::Result<[Vec<u8>; 3]> {
-        // Construct nonce = (salt || iv) XOR padded_seq
-        let salt = self.salt();
-        let iv = self.iv();
-        let nonce_len = salt.len() + iv.len();
-        let mut nonce = Vec::with_capacity(nonce_len);
-        nonce.extend_from_slice(salt);
-        nonce.extend_from_slice(iv);
-        let seq_be = seq.to_be_bytes();
-        let seq_be_len = seq_be.len();
-        assert!(nonce_len >= seq_be_len);
-        seq_be
-            .into_iter()
-            .zip(nonce.iter_mut().skip(nonce_len - seq_be_len))
-            .for_each(|(s, n)| *n ^= s);
-
-        // AAD = TLS record header
-        const TAG_LEN: usize = 16;
-        let encrypted_len: u16 = (inner_plaintext.len() + TAG_LEN)
-            .try_into()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many bytes"))?;
-        let mut aad = Vec::new();
-        aad.push(ContentType::ApplicationData.into());
-        aad.extend_from_slice(&u16::from(ProtocolVersion::TLSv1_2).to_be_bytes());
-        aad.extend_from_slice(&encrypted_len.to_be_bytes());
-
-        // AEAD-encrypt
-        let mut tag = vec![0u8; TAG_LEN];
-        let ciphertext = symm::encrypt_aead(
-            self.cipher_kind.into(),
-            self.key(),
-            Some(&nonce),
-            &aad,
-            inner_plaintext,
-            &mut tag,
-        )?;
-
-        Ok([aad, ciphertext, tag])
-    }
-}
-
-pub(crate) fn probe_tls13_secret_offsets(mode: MemmemMode) -> io::Result<(usize, usize)> {
+pub(crate) fn rs_probe_tls13_secret_offsets(mode: MemmemMode) -> io::Result<(usize, usize)> {
     // Cached secret offsets
     static TLS13_SECRET_OFFSETS: OnceLock<(usize, usize)> = OnceLock::new();
     if let Some(offsets) = TLS13_SECRET_OFFSETS.get() {
@@ -446,32 +391,53 @@ pub(crate) fn probe_tls13_secret_offsets(mode: MemmemMode) -> io::Result<(usize,
     Ok(*TLS13_SECRET_OFFSETS.get_or_init(|| (client_offset, server_offset)))
 }
 
-fn tls13_hkdf_expand(md: &MdRef, secret: &[u8], label: &[u8], out: &mut [u8]) -> io::Result<()> {
-    const LABEL_PREFIX: &[u8] = b"tls13 ";
-    let out_len: u16 = out
-        .len()
-        .try_into()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "requested too large"))?;
-    let label_len: u8 = (LABEL_PREFIX.len() + label.len())
-        .try_into()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "label too long"))?;
+impl Encryptor for &MdRef {
+    fn tls13_hkdf_expand(&self, secret: &[u8], label: &[u8], out: &mut [u8]) -> io::Result<()> {
+        const LABEL_PREFIX: &[u8] = b"tls13 ";
+        let out_len: u16 = out
+            .len()
+            .try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "requested too large"))?;
+        let label_len: u8 = (LABEL_PREFIX.len() + label.len())
+            .try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "label too long"))?;
 
-    let mut hkdf_info = vec![];
-    hkdf_info.extend_from_slice(&out_len.to_be_bytes());
-    hkdf_info.push(label_len);
-    hkdf_info.extend_from_slice(LABEL_PREFIX);
-    hkdf_info.extend_from_slice(label);
-    hkdf_info.push(0); // no data
+        let mut hkdf_info = vec![];
+        hkdf_info.extend_from_slice(&out_len.to_be_bytes());
+        hkdf_info.push(label_len);
+        hkdf_info.extend_from_slice(LABEL_PREFIX);
+        hkdf_info.extend_from_slice(label);
+        hkdf_info.push(0); // no data
 
-    use openssl::pkey_ctx::{HkdfMode, PkeyCtx};
-    let mut ctx = PkeyCtx::new_id(Id::HKDF)?;
-    ctx.derive_init()?;
-    ctx.set_hkdf_mode(HkdfMode::EXPAND_ONLY)?;
-    ctx.set_hkdf_md(md)?;
-    ctx.set_hkdf_key(secret)?;
-    ctx.add_hkdf_info(&hkdf_info)?;
-    ctx.derive(Some(out))?;
-    Ok(())
+        use openssl::pkey_ctx::{HkdfMode, PkeyCtx};
+        let mut ctx = PkeyCtx::new_id(Id::HKDF)?;
+        ctx.derive_init()?;
+        ctx.set_hkdf_mode(HkdfMode::EXPAND_ONLY)?;
+        ctx.set_hkdf_md(self)?;
+        ctx.set_hkdf_key(secret)?;
+        ctx.add_hkdf_info(&hkdf_info)?;
+        ctx.derive(Some(out))?;
+        Ok(())
+    }
+
+    fn encrypt_aead(
+        &self,
+        cipher_kind: CipherKind,
+        key: &[u8],
+        nonce: &[u8],
+        aad: &[u8],
+        inner_plaintext: &[u8],
+        tag: &mut [u8],
+    ) -> io::Result<Vec<u8>> {
+        Ok(symm::encrypt_aead(
+            cipher_kind.into(),
+            key,
+            Some(nonce),
+            aad,
+            inner_plaintext,
+            tag,
+        )?)
+    }
 }
 
 async fn handshake<S>(
@@ -506,7 +472,7 @@ where
     }
 }
 
-pub(crate) async fn connect_ktls<S>(
+pub(crate) async fn rs_connect_ktls<S>(
     config: Arc<SslConnector>,
     domain: &str,
     stream: S,
@@ -517,14 +483,14 @@ where
 {
     let res = config.connect(domain, RecordStream::new(stream));
     let ssl_stream = handshake(res).await?;
-    let mut session = KtlsSession::from_ssl(ssl_stream, mode)?;
+    let mut session = OpenSslSession::from_ssl(ssl_stream, mode)?;
     let secrets = session.extract_tls13_secrets()?;
     let stream = session.take_inner()?;
     super::setup_ktls(&stream, secrets, &session).map_err(io::Error::other)?;
     Ok(KtlsDuplexStream::new(stream, session).into())
 }
 
-pub(crate) async fn accept_ktls<S>(
+pub(crate) async fn rs_accept_ktls<S>(
     config: Arc<SslAcceptor>,
     stream: S,
     mode: MemmemMode,
@@ -534,7 +500,7 @@ where
 {
     let res = config.accept(RecordStream::new(stream));
     let ssl_stream = handshake(res).await?;
-    let mut session = KtlsSession::from_ssl(ssl_stream, mode)?;
+    let mut session = OpenSslSession::from_ssl(ssl_stream, mode)?;
     let secrets = session.extract_tls13_secrets()?;
     let stream = session.take_inner()?;
     super::setup_ktls(&stream, secrets, &session).map_err(io::Error::other)?;

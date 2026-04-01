@@ -99,7 +99,7 @@ impl KtlsConnector {
             #[cfg(feature = "openssl")]
             KtlsConnectorInner::OpenSsl { memmem_mode, .. } => {
                 let mode = memmem_mode.unwrap_or(super::ossl::MemmemMode::Fork);
-                if super::ossl::probe_tls13_secret_offsets(mode).is_err() {
+                if super::ossl::rs_probe_tls13_secret_offsets(mode).is_err() {
                     return Ok(Err(stream));
                 }
             }
@@ -123,7 +123,7 @@ impl KtlsConnector {
                     memmem_mode: mode,
                 } => {
                     let mode = mode.unwrap_or(super::ossl::MemmemMode::Fork);
-                    super::ossl::connect_ktls(c.clone(), domain, stream, mode).await?
+                    super::ossl::rs_connect_ktls(c.clone(), domain, stream, mode).await?
                 }
                 #[cfg(not(any(feature = "rustls", feature = "openssl")))]
                 KtlsConnectorInner::None(v) => match *v {},
@@ -250,7 +250,7 @@ impl KtlsAcceptor {
             #[cfg(feature = "openssl")]
             KtlsAcceptorInner::OpenSsl { memmem_mode, .. } => {
                 let mode = memmem_mode.unwrap_or(super::ossl::MemmemMode::Fork);
-                if super::ossl::probe_tls13_secret_offsets(mode).is_err() {
+                if super::ossl::rs_probe_tls13_secret_offsets(mode).is_err() {
                     return Ok(Err(stream));
                 }
             }
@@ -267,7 +267,7 @@ impl KtlsAcceptor {
                     memmem_mode: mode,
                 } => {
                     let mode = mode.unwrap_or(super::ossl::MemmemMode::Fork);
-                    super::ossl::accept_ktls(acceptor.clone(), stream, mode).await?
+                    super::ossl::rs_accept_ktls(acceptor.clone(), stream, mode).await?
                 }
                 #[cfg(not(any(feature = "rustls", feature = "openssl")))]
                 KtlsAcceptorInner::None(v) => match *v {},
@@ -294,7 +294,7 @@ type RustlsClientConnection<S> =
 type RustlsServerConnection<S> =
     KtlsDuplexStream<S, rustls::kernel::KernelConnection<rustls::server::ServerConnectionData>>;
 #[cfg(feature = "openssl")]
-type OpenSslConnection<S> = KtlsDuplexStream<S, super::ossl::KtlsSession<S>>;
+type OpenSslConnection<S> = KtlsDuplexStream<S, super::ossl::OpenSslSession<S>>;
 
 /// A kTLS stream that encrypts/decrypts data in the Linux kernel.
 ///
@@ -495,7 +495,7 @@ type RustlsClientReadHalf<S> =
 type RustlsServerReadHalf<S> =
     ReadHalf<S, rustls::kernel::KernelConnection<rustls::server::ServerConnectionData>>;
 #[cfg(feature = "openssl")]
-type OpenSslReadHalf<S> = ReadHalf<S, super::ossl::KtlsSession<S>>;
+type OpenSslReadHalf<S> = ReadHalf<S, super::ossl::OpenSslSession<S>>;
 
 enum KtlsReadHalfInner<S> {
     #[cfg(feature = "rustls")]
@@ -541,30 +541,6 @@ where
 
 pub struct KtlsWriteHalf<S>(KtlsWriteHalfInner<S>);
 
-impl<S> KtlsWriteHalf<S>
-where
-    S: AsyncWrite + AsyncReadAncillary + AsyncWriteAncillary + AsFd,
-{
-    /// Initiates a TLS 1.3 key update.
-    ///
-    /// This updates the outgoing (TX) traffic secret. If `request_peer` is
-    /// `true`, the peer is also asked to update its outgoing secret so that
-    /// both directions will use fresh keys after the next round-trip.
-    #[cfg(key_update)]
-    pub async fn key_update(&mut self, request_peer: bool) -> io::Result<()> {
-        match &mut self.0 {
-            #[cfg(feature = "rustls")]
-            KtlsWriteHalfInner::RustlsClient(s) => s.key_update(request_peer).await,
-            #[cfg(feature = "rustls")]
-            KtlsWriteHalfInner::RustlsServer(s) => s.key_update(request_peer).await,
-            #[cfg(feature = "openssl")]
-            KtlsWriteHalfInner::OpenSsl(s) => s.key_update(request_peer).await,
-            #[cfg(not(any(feature = "rustls", feature = "openssl")))]
-            KtlsWriteHalfInner::None(f, ..) => match *f {},
-        }
-    }
-}
-
 #[cfg(feature = "rustls")]
 type RustlsClientWriteHalf<S> =
     WriteHalf<S, rustls::kernel::KernelConnection<rustls::client::ClientConnectionData>>;
@@ -572,7 +548,7 @@ type RustlsClientWriteHalf<S> =
 type RustlsServerWriteHalf<S> =
     WriteHalf<S, rustls::kernel::KernelConnection<rustls::server::ServerConnectionData>>;
 #[cfg(feature = "openssl")]
-type OpenSslWriteHalf<S> = WriteHalf<S, super::ossl::KtlsSession<S>>;
+type OpenSslWriteHalf<S> = WriteHalf<S, super::ossl::OpenSslSession<S>>;
 
 enum KtlsWriteHalfInner<S> {
     #[cfg(feature = "rustls")]
@@ -636,6 +612,30 @@ where
             KtlsWriteHalfInner::RustlsServer(s) => s.shutdown().await,
             #[cfg(feature = "openssl")]
             KtlsWriteHalfInner::OpenSsl(s) => s.shutdown().await,
+            #[cfg(not(any(feature = "rustls", feature = "openssl")))]
+            KtlsWriteHalfInner::None(f, ..) => match *f {},
+        }
+    }
+}
+
+impl<S> KtlsWriteHalf<S>
+where
+    S: AsyncWrite + AsyncReadAncillary + AsyncWriteAncillary + AsFd,
+{
+    /// Initiates a TLS 1.3 key update.
+    ///
+    /// This updates the outgoing (TX) traffic secret. If `request_peer` is
+    /// `true`, the peer is also asked to update its outgoing secret so that
+    /// both directions will use fresh keys after the next round-trip.
+    #[cfg(key_update)]
+    pub async fn key_update(&mut self, request_peer: bool) -> io::Result<()> {
+        match &mut self.0 {
+            #[cfg(feature = "rustls")]
+            KtlsWriteHalfInner::RustlsClient(s) => s.key_update(request_peer).await,
+            #[cfg(feature = "rustls")]
+            KtlsWriteHalfInner::RustlsServer(s) => s.key_update(request_peer).await,
+            #[cfg(feature = "openssl")]
+            KtlsWriteHalfInner::OpenSsl(s) => s.key_update(request_peer).await,
             #[cfg(not(any(feature = "rustls", feature = "openssl")))]
             KtlsWriteHalfInner::None(f, ..) => match *f {},
         }
