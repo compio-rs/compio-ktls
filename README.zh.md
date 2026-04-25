@@ -20,13 +20,7 @@
 
 - `rustls`（默认）：启用 Rustls 集成
 - `ring`：使用 ring 作为加密后端
-- `app-write-with-empty-ancillary`：在写入应用数据时使用 `write_with_ancillary()` 而非
-  `write()`。compio-rs/compio#756 引入了 io-uring 的零拷贝写入，改变了 `write()`
-  的默认行为，而这会在启用了 kTLS 的 socket 上出错。因此，使用 io-uring 时，应启用该 feature
-  来绕过 zero-copy 写入与 kTLS 的冲突。
 - `sync`：单线程无须开启，多线程才需要。仅对读写分离有用。
-
-（所以基本上就是，除非你自己指定 `compio/polling`，不然所有 feature 都得启用就对了，除了 `sync`）
 
 ## 使用方法
 
