@@ -25,11 +25,12 @@ where
 {
     let mut conn = UnbufferedClientConnection::new(config, domain).map_err(io::Error::other)?;
     handshake(&mut stream, &mut conn).await?;
+    let alpn_protocol = conn.alpn_protocol().map(|p| p.to_vec());
     let (secrets, session) = conn
         .dangerous_into_kernel_connection()
         .map_err(io::Error::other)?;
     setup_ktls(&stream, secrets, &session)?;
-    Ok(KtlsDuplexStream::new(stream, session).into())
+    Ok(KtlsDuplexStream::new(stream, session, alpn_protocol).into())
 }
 
 pub(crate) async fn accept_ktls<S>(
@@ -41,11 +42,12 @@ where
 {
     let mut conn = UnbufferedServerConnection::new(config).map_err(io::Error::other)?;
     handshake(&mut stream, &mut conn).await?;
+    let alpn_protocol = conn.alpn_protocol().map(|p| p.to_vec());
     let (secrets, session) = conn
         .dangerous_into_kernel_connection()
         .map_err(io::Error::other)?;
     setup_ktls(&stream, secrets, &session)?;
-    Ok(KtlsDuplexStream::new(stream, session).into())
+    Ok(KtlsDuplexStream::new(stream, session, alpn_protocol).into())
 }
 
 trait UnbufferedConnection {
