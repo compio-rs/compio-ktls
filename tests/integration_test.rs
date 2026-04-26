@@ -551,6 +551,172 @@ mod ktls_tests {
         }
     }
 
+    /// Test that negotiated_alpn() returns the correct protocol after kTLS
+    /// handshake
+    #[compio::test]
+    async fn test_ktls_negotiated_alpn() {
+        // Load test certificates
+        let cert_pem = std::fs::read("tests/fixtures/cert.pem").unwrap();
+        let key_pem = std::fs::read("tests/fixtures/key.pem").unwrap();
+        let certs = rustls_pemfile::certs(&mut cert_pem.as_slice())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
+            .unwrap()
+            .unwrap();
+
+        let mut server_config = rustls::server::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
+        server_config.enable_secret_extraction = true;
+        server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Spawn kTLS server that checks ALPN
+        let server_handle = compio::runtime::spawn(async move {
+            let acceptor = KtlsAcceptor::from(Arc::new(server_config));
+            let (stream, _) = listener.accept().await.unwrap();
+
+            match acceptor.accept(stream).await.unwrap() {
+                Ok(mut ktls_stream) => {
+                    // Verify server sees the negotiated ALPN
+                    let alpn = ktls_stream.negotiated_alpn();
+                    assert_eq!(alpn.as_deref(), Some(b"h2".as_slice()));
+
+                    // Echo
+                    let buf = vec![0u8; 1024];
+                    let (n, buf) = ktls_stream.read(buf).await.unwrap();
+                    ktls_stream.write_all(buf[..n].to_vec()).await.unwrap();
+                    ktls_stream.flush().await.unwrap();
+                    ktls_stream.shutdown().await.ok();
+                    true
+                }
+                Err(mut stream) => {
+                    stream.shutdown().await.ok();
+                    false
+                }
+            }
+        });
+
+        // Connect with kTLS client, also with ALPN
+        let mut client_config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        client_config.enable_secret_extraction = true;
+        client_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+        let connector = KtlsConnector::from(Arc::new(client_config));
+        let stream = TcpStream::connect(addr).await.unwrap();
+
+        let client_ktls = match connector.connect("localhost", stream).await.unwrap() {
+            Ok(mut ktls_stream) => {
+                // Verify client sees the negotiated ALPN
+                let alpn = ktls_stream.negotiated_alpn();
+                assert_eq!(alpn.as_deref(), Some(b"h2".as_slice()));
+
+                let msg = b"ALPN test";
+                ktls_stream.write_all(msg.to_vec()).await.unwrap();
+                ktls_stream.flush().await.unwrap();
+                let (n, buf) = ktls_stream.read(vec![0u8; 1024]).await.unwrap();
+                assert_eq!(&buf[..n], msg);
+                ktls_stream.shutdown().await.ok();
+                true
+            }
+            Err(stream) => {
+                drop(stream);
+                false
+            }
+        };
+
+        let server_ktls = server_handle.await.unwrap();
+        if !client_ktls && !server_ktls {
+            eprintln!("Warning: kTLS not available on this system");
+        }
+    }
+
+    /// Test that negotiated_alpn() returns None when no ALPN is configured
+    #[compio::test]
+    async fn test_ktls_negotiated_alpn_none() {
+        // Load test certificates
+        let cert_pem = std::fs::read("tests/fixtures/cert.pem").unwrap();
+        let key_pem = std::fs::read("tests/fixtures/key.pem").unwrap();
+        let certs = rustls_pemfile::certs(&mut cert_pem.as_slice())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
+            .unwrap()
+            .unwrap();
+
+        let mut server_config = rustls::server::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
+        server_config.enable_secret_extraction = true;
+        // No ALPN configured on server
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_handle = compio::runtime::spawn(async move {
+            let acceptor = KtlsAcceptor::from(Arc::new(server_config));
+            let (stream, _) = listener.accept().await.unwrap();
+
+            match acceptor.accept(stream).await.unwrap() {
+                Ok(mut ktls_stream) => {
+                    assert_eq!(ktls_stream.negotiated_alpn(), None);
+
+                    let buf = vec![0u8; 1024];
+                    let (n, buf) = ktls_stream.read(buf).await.unwrap();
+                    ktls_stream.write_all(buf[..n].to_vec()).await.unwrap();
+                    ktls_stream.flush().await.unwrap();
+                    ktls_stream.shutdown().await.ok();
+                    true
+                }
+                Err(mut stream) => {
+                    stream.shutdown().await.ok();
+                    false
+                }
+            }
+        });
+
+        // No ALPN on client either
+        let mut client_config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        client_config.enable_secret_extraction = true;
+
+        let connector = KtlsConnector::from(Arc::new(client_config));
+        let stream = TcpStream::connect(addr).await.unwrap();
+
+        let client_ktls = match connector.connect("localhost", stream).await.unwrap() {
+            Ok(mut ktls_stream) => {
+                assert_eq!(ktls_stream.negotiated_alpn(), None);
+
+                let msg = b"No ALPN";
+                ktls_stream.write_all(msg.to_vec()).await.unwrap();
+                ktls_stream.flush().await.unwrap();
+                let (n, buf) = ktls_stream.read(vec![0u8; 1024]).await.unwrap();
+                assert_eq!(&buf[..n], msg);
+                ktls_stream.shutdown().await.ok();
+                true
+            }
+            Err(stream) => {
+                drop(stream);
+                false
+            }
+        };
+
+        let server_ktls = server_handle.await.unwrap();
+        if !client_ktls && !server_ktls {
+            eprintln!("Warning: kTLS not available on this system");
+        }
+    }
+
     #[derive(Debug)]
     struct NoVerifier;
 

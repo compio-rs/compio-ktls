@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MulanPSL-2.0
 // Copyright 2026 Fantix King
 
-use std::{io, os::fd::AsFd, sync::Arc};
+use std::{borrow::Cow, io, os::fd::AsFd, sync::Arc};
 
 use compio_buf::{BufResult, IoBuf, IoBufMut, IoVectoredBuf, IoVectoredBufMut};
 use compio_io::{
@@ -268,6 +268,19 @@ impl<S> From<RustlsClientConnection<S>> for KtlsStream<S> {
 impl<S> From<RustlsServerConnection<S>> for KtlsStream<S> {
     fn from(s: RustlsServerConnection<S>) -> Self {
         Self(KtlsStreamInner::RustlsServer(s))
+    }
+}
+
+impl<S> KtlsStream<S> {
+    pub fn negotiated_alpn(&self) -> Option<Cow<'_, [u8]>> {
+        match &self.0 {
+            #[cfg(feature = "rustls")]
+            KtlsStreamInner::RustlsClient(s) => s.alpn_protocol().map(Cow::from),
+            #[cfg(feature = "rustls")]
+            KtlsStreamInner::RustlsServer(s) => s.alpn_protocol().map(Cow::from),
+            #[cfg(not(feature = "rustls"))]
+            KtlsStreamInner::None(f, ..) => match *f {},
+        }
     }
 }
 

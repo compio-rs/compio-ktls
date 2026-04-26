@@ -20,16 +20,22 @@ pub(crate) struct KtlsDuplexStream<S, C> {
     session: C,
     incoming_closed: bool,
     outgoing_state: OutgoingState,
+    alpn_protocol: Option<Vec<u8>>,
 }
 
 impl<S, C> KtlsDuplexStream<S, C> {
-    pub(crate) fn new(inner: S, session: C) -> Self {
+    pub(crate) fn new(inner: S, session: C, alpn_protocol: Option<Vec<u8>>) -> Self {
         Self {
             inner: Some(inner),
             session,
             incoming_closed: false,
             outgoing_state: OutgoingState::Open,
+            alpn_protocol,
         }
+    }
+
+    pub(crate) fn alpn_protocol(&self) -> Option<&[u8]> {
+        self.alpn_protocol.as_deref()
     }
 
     fn stream(&mut self) -> io::Result<&mut S> {
