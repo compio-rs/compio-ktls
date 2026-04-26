@@ -4,7 +4,7 @@
 use std::{io, os::fd::AsFd, slice, sync::Arc};
 
 use compio_buf::{IoBuf, buf_try};
-use compio_io::{AsyncRead, AsyncWrite, ancillary::AsyncWriteAncillary};
+use compio_io::{AsyncRead, AsyncWrite, AsyncWriteExt, ancillary::AsyncWriteAncillary};
 use rustls::{
     ClientConfig, ProtocolVersion, ServerConfig,
     client::UnbufferedClientConnection,
@@ -115,17 +115,7 @@ where
                 }
             }
             TransmitTlsData(data) => {
-                #[cfg(feature = "app-write-with-empty-ancillary")]
-                {
-                    use super::write_ext::AsyncWriteAncillaryExt;
-                    (_, (outgoing_tls, _)) =
-                        buf_try!(@try stream.write_all_with_ancillary(outgoing_tls, []).await);
-                }
-                #[cfg(not(feature = "app-write-with-empty-ancillary"))]
-                {
-                    use compio_io::AsyncWriteExt;
-                    outgoing_tls = buf_try!(@try stream.write_all(outgoing_tls).await).1;
-                }
+                outgoing_tls = buf_try!(@try stream.write_all(outgoing_tls).await).1;
                 outgoing_tls.clear();
                 data.done();
             }

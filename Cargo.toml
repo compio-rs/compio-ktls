@@ -11,17 +11,10 @@ categories = ["asynchronous", "network-programming", "cryptography"]
 readme = "README.md"
 
 [dependencies]
+compio-io = { version = "0.10.0-rc.1", default-features = false, features = ["ancillary", "bytemuck"]}
+compio-buf = { version = "0.8.2-rc.1", default-features = false }
 rustls = { version = "0.23", default-features = false, optional = true }
 synchrony = { version = "0.1", features = ["bilock"] }
-
-[dependencies.compio-io]
-version = "0.9"
-default-features = false
-features = ["ancillary", "bytemuck"]
-
-[dependencies.compio-buf]
-version = "0.8"
-default-features = false
 
 [target."cfg(target_os = \"linux\")".dependencies]
 libc = "0.2"
@@ -31,22 +24,9 @@ ktls-core = "0.0.5"
 default = ["rustls"]
 rustls = ["dep:rustls", "ktls-core/shim-rustls"]
 ring = ["rustls", "rustls/ring"]
-app-write-with-empty-ancillary = []
 sync = []
 
 [dev-dependencies]
-compio = { version = "0.18", features = ["net", "rustls", "macros"] }
+compio = { version = "0.19.0-rc.1", features = ["net", "rustls", "macros"] }
 rustls-native-certs = "0.8"
 rustls-pemfile = "2.2"
-
-[patch.crates-io.compio]
-git = "https://github.com/compio-rs/compio.git"
-rev = "ffb642c7061d2146c719534e8e6ee877ffc25bcf"
-
-[patch.crates-io.compio-io]
-git = "https://github.com/compio-rs/compio.git"
-rev = "ffb642c7061d2146c719534e8e6ee877ffc25bcf"
-
-[patch.crates-io.compio-buf]
-git = "https://github.com/compio-rs/compio.git"
-rev = "ffb642c7061d2146c719534e8e6ee877ffc25bcf"

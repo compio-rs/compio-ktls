@@ -147,17 +147,7 @@ where
         if self.outgoing_state.is_open() {
             let res = {
                 let (stream, buf) = buf_try!(self.stream(), buf);
-                #[cfg(not(feature = "app-write-with-empty-ancillary"))]
-                {
-                    stream.write(buf).await
-                }
-                #[cfg(feature = "app-write-with-empty-ancillary")]
-                {
-                    stream
-                        .write_with_ancillary(buf, [])
-                        .await
-                        .map_buffer(|(b, _)| b)
-                }
+                stream.write(buf).await
             };
             match res {
                 BufResult(Err(e), b) => BufResult(self.inspect_error(e).await, b),
@@ -173,17 +163,7 @@ where
         if self.outgoing_state.is_open() {
             let res = {
                 let (stream, buf) = buf_try!(self.stream(), buf);
-                #[cfg(not(feature = "app-write-with-empty-ancillary"))]
-                {
-                    stream.write_vectored(buf).await
-                }
-                #[cfg(feature = "app-write-with-empty-ancillary")]
-                {
-                    stream
-                        .write_vectored_with_ancillary(buf, [])
-                        .await
-                        .map_buffer(|(b, _)| b)
-                }
+                stream.write_vectored(buf).await
             };
             match res {
                 BufResult(Err(e), b) => BufResult(self.inspect_error(e).await, b),

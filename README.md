@@ -20,11 +20,6 @@ Kernel TLS (kTLS) support for [Compio](https://github.com/compio-rs/compio).
 
 - `rustls` (default): Enable Rustls integration
 - `ring`: Use ring as the crypto backend
-- `app-write-with-empty-ancillary`: Use `write_with_ancillary()` instead of `write()` for
-  application data writes. compio-rs/compio#756 introduced zero-copy writes for io-uring,
-  which changed the default behavior of `write()` in a way that breaks on kTLS-enabled
-  sockets. Enable this feature when using io-uring to work around the conflict between
-  zero-copy writes and kTLS.
 - `sync`: Use thread-safe locks for the split read/write halves. By default, single-threaded
   (unsync) locks are used. Enable this feature if you need to use the split halves across
   threads.
